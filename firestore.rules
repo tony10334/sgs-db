@@ -1,0 +1,23 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // 玩家資料：登入就能看（開局時要選人），只能改自己的
+    match /users/{uid} {
+      allow read: if request.auth != null;
+      allow write: if request.auth != null && request.auth.uid == uid;
+    }
+
+    // 對局：登入就能看；新增時 createdBy 必須是自己；只有建立者能改/刪
+    match /games/{gameId} {
+      allow read: if request.auth != null;
+      allow create: if request.auth != null
+        && request.resource.data.createdBy == request.auth.uid
+        && request.resource.data.seats is list
+        && request.resource.data.seats.size() >= 4
+        && request.resource.data.seats.size() <= 10;
+      allow update, delete: if request.auth != null
+        && resource.data.createdBy == request.auth.uid;
+    }
+  }
+}
