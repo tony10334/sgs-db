@@ -2,6 +2,15 @@ rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
 
+    function signedIn() { return request.auth != null; }
+    function myEmail() { return request.auth.token.email.lower(); }
+    // 管理員：admins/{email} 有這份文件就是管理員（email 全小寫）
+    function isAdmin() {
+      return signedIn()
+        && request.auth.token.email_verified == true
+        && exists(/databases/$(database)/documents/admins/$(myEmail()));
+    }
+
     // 玩家資料：登入就能看（開局時要選人），只能改自己的
     match /users/{uid} {
       allow read: if request.auth != null;
@@ -18,6 +27,27 @@ service cloud.firestore {
         && request.resource.data.seats.size() <= 10;
       allow update, delete: if request.auth != null
         && resource.data.createdBy == request.auth.uid;
+    }
+
+    // 武將資料：不用登入也能看；只有管理員能改
+    match /site/heroes {
+      allow read: if true;
+      allow create, update: if isAdmin()
+        && request.resource.data.heroes is list
+        && request.resource.data.updatedBy == myEmail();
+    }
+
+    // 管理員名單：
+    // - 登入的人可以查「自己」是不是管理員
+    // - 管理員可以看整份名單、加人、移除別人
+    // - 不能移除自己（避免最後沒有人能管理）
+    match /admins/{email} {
+      allow get: if signedIn() && email == myEmail();
+      allow read: if isAdmin();
+      allow create: if isAdmin()
+        && email == email.lower()
+        && request.resource.data.addedBy == myEmail();
+      allow delete: if isAdmin() && email != myEmail();
     }
   }
 }

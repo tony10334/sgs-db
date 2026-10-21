@@ -46,6 +46,54 @@ function shuffle(arr) {
   return a;
 }
 
+/* ---------- 武將資料：整理與檢查 ---------- */
+const FACTIONS = ['魏', '蜀', '吳', '群'];
+const DIFF = ['', '新手友善', '中等', '進階'];
+const str = (v) => (v == null ? '' : String(v)).trim();
+const strList = (v) => (Array.isArray(v) ? v.map(str).filter(Boolean) : []);
+const splitList = (s) => str(s).split(/[,，、\n]/).map((x) => x.trim()).filter(Boolean);
+
+// 只留下認得的欄位，型別轉好（資料可能來自上傳的 JSON 或資料庫）
+function normalizeHero(h) {
+  h = h && typeof h === 'object' ? h : {};
+  return {
+    id: str(h.id), name: str(h.name), version: str(h.version), title: str(h.title),
+    faction: str(h.faction), hp: Number(h.hp), difficulty: Number(h.difficulty),
+    aliases: strList(h.aliases), tagline: str(h.tagline), roles: strList(h.roles),
+    skills: (Array.isArray(h.skills) ? h.skills : []).map((s) => ({ name: str(s?.name), plain: str(s?.plain), tip: str(s?.tip) })),
+  };
+}
+// 單一武將的欄位檢查，回傳錯誤訊息陣列
+function validateHero(h) {
+  const e = [];
+  if (!/^[a-z0-9_-]+$/.test(h.id)) e.push('id 要填，只能用小寫英文、數字、_ 或 -');
+  if (!h.name) e.push('名字沒填');
+  if (!h.version) e.push('版本沒填');
+  if (!FACTIONS.includes(h.faction)) e.push(`勢力只能是 ${FACTIONS.join('／')}`);
+  if (!Number.isInteger(h.hp) || h.hp < 1 || h.hp > 10) e.push('血量要是 1–10 的整數');
+  if (![1, 2, 3].includes(h.difficulty)) e.push('難度要是 1、2 或 3');
+  if (!h.tagline) e.push('一句話定位沒填');
+  if (!h.skills.length) e.push('至少要有一個技能');
+  h.skills.forEach((s, j) => { if (!s.name || !s.plain) e.push(`第 ${j + 1} 個技能的名稱和白話說明都要填`); });
+  return e;
+}
+// 整批檢查（含 id、名字不可重複）
+function validateHeroes(list) {
+  const errors = [];
+  const heroes = list.map(normalizeHero);
+  const ids = new Map();
+  const names = new Map();
+  heroes.forEach((h, i) => {
+    const who = `第 ${i + 1} 筆${h.name ? `（${h.name}）` : ''}`;
+    validateHero(h).forEach((m) => errors.push(`${who}：${m}`));
+    if (h.id && ids.has(h.id)) errors.push(`${who}：id「${h.id}」跟第 ${ids.get(h.id) + 1} 筆重複`);
+    else ids.set(h.id, i);
+    if (h.name && names.has(h.name)) errors.push(`${who}：名字「${h.name}」跟第 ${names.get(h.name) + 1} 筆重複`);
+    else names.set(h.name, i);
+  });
+  return { errors, heroes };
+}
+
 /* ---------- 資料層：本機模式 ---------- */
 function createLocalStore() {
   let onChange = () => {};
@@ -55,7 +103,9 @@ function createLocalStore() {
     async init(cb) {
       onChange = cb;
       const uid = ls.get('sgs_me', null);
-      store.user = ls.get('sgs_users', []).find((u) => u.uid === uid) || null;
+      const u = ls.get('sgs_users', []).find((x) => x.uid === uid);
+      // 本機模式：登入就有管理權限，方便測試管理頁
+      store.user = u ? { ...u, isAdmin: true } : null;
       onChange(store.user);
     },
     async signIn(name) {
@@ -69,8 +119,8 @@ function createLocalStore() {
         ls.set('sgs_users', users);
       }
       ls.set('sgs_me', u.uid);
-      store.user = u;
-      onChange(u);
+      store.user = { ...u, isAdmin: true };
+      onChange(store.user);
     },
     async signOut() { ls.set('sgs_me', null); store.user = null; onChange(null); },
     async rename(name) {
@@ -89,6 +139,15 @@ function createLocalStore() {
       return id;
     },
     async deleteGame(id) { ls.set('sgs_games', ls.get('sgs_games', []).filter((g) => g.id !== id)); },
+    // 武將：管理頁存過才有，沒有就回傳 null（改用 data/heroes.json）
+    async loadHeroes() { return ls.get('sgs_heroes', null); },
+    async saveHeroes(list) { ls.set('sgs_heroes', list); },
+    // 管理員名單（本機模式只是讓畫面可以測試）
+    async listAdmins() { return ls.get('sgs_admins', []); },
+    async addAdmin(email) {
+      ls.set('sgs_admins', [...ls.get('sgs_admins', []), { email, addedBy: store.user.name, addedAt: Date.now() }]);
+    },
+    async removeAdmin(email) { ls.set('sgs_admins', ls.get('sgs_admins', []).filter((a) => a.email !== email)); },
   };
   return store;
 }
@@ -104,6 +163,18 @@ async function createFirebaseStore() {
   const app = initializeApp(firebaseConfig);
   const auth = A.getAuth(app);
   const db = F.getFirestore(app);
+  const heroesRef = F.doc(db, 'site', 'heroes');
+
+  // admins/{email} 存在就是管理員（規則允許每個人查自己那一筆）
+  async function checkAdmin(email) {
+    if (!email) return false;
+    try {
+      return (await F.getDoc(F.doc(db, 'admins', email))).exists();
+    } catch (e) {
+      console.error(e);
+      return false;
+    }
+  }
 
   const store = {
     mode: 'firebase',
@@ -118,7 +189,9 @@ async function createFirebaseStore() {
               const snap = await F.getDoc(ref);
               const name = (snap.exists() && snap.data().name) || fu.displayName || '玩家';
               await F.setDoc(ref, { name, photo: fu.photoURL || '', lastLogin: Date.now() }, { merge: true });
-              store.user = { uid: fu.uid, name, photo: fu.photoURL || '' };
+              // email 只留在這支手機的記憶體，不寫進 users（users 所有登入者都看得到）
+              const email = (fu.email || '').toLowerCase();
+              store.user = { uid: fu.uid, name, photo: fu.photoURL || '', email, isAdmin: await checkAdmin(email) };
             } else {
               store.user = null;
             }
@@ -158,6 +231,22 @@ async function createFirebaseStore() {
     },
     async addGame(g) { return (await F.addDoc(F.collection(db, 'games'), g)).id; },
     async deleteGame(id) { await F.deleteDoc(F.doc(db, 'games', id)); },
+    // 武將：全部放在 site/heroes 一份文件（每次開網頁只算 1 次讀取）
+    async loadHeroes() {
+      const snap = await F.getDoc(heroesRef);
+      return snap.exists() ? snap.data().heroes : null;
+    },
+    async saveHeroes(list) {
+      await F.setDoc(heroesRef, { heroes: list, updatedAt: Date.now(), updatedBy: store.user.email });
+    },
+    async listAdmins() {
+      const s = await F.getDocs(F.collection(db, 'admins'));
+      return s.docs.map((d) => ({ email: d.id, ...d.data() }));
+    },
+    async addAdmin(email) {
+      await F.setDoc(F.doc(db, 'admins', email), { addedBy: store.user.email, addedAt: Date.now() });
+    },
+    async removeAdmin(email) { await F.deleteDoc(F.doc(db, 'admins', email)); },
   };
   return store;
 }
@@ -174,6 +263,8 @@ const state = {
   games: null,
   minGames: 1,
   draft: ls.get('sgs_draft', null) || newDraft(5),
+  heroSource: 'file', // 'db' = 管理頁存過的資料，'file' = data/heroes.json
+  admin: { tab: 'heroes', q: '', editing: null, isNew: false, upload: { text: '', mode: 'merge' } },
 };
 
 function newDraft(count) {
@@ -266,13 +357,14 @@ function heroMatch(h, q) {
 }
 function heroCard(h) {
   const open = state.openHero === h.id;
-  const diff = ['', '新手友善', '中等', '進階'][h.difficulty] || '';
+  const diff = DIFF[h.difficulty] || '';
+  const hp = Math.max(0, Math.min(10, h.hp | 0));
   return `<div class="card clickable" data-hero="${esc(h.id)}">
     <div class="hero-head">
       <div class="faction ${esc(h.faction)}">${esc(h.faction)}</div>
       <div>
         <div class="hero-name">${esc(h.name)} <span class="hero-sub">${esc(h.version)}・${esc(h.title || '')}</span></div>
-        <div class="hp">${'●'.repeat(h.hp)} <span class="hero-sub">${h.hp} 血</span></div>
+        <div class="hp">${'●'.repeat(hp)} <span class="hero-sub">${hp} 血</span></div>
       </div>
     </div>
     <p class="tagline">${esc(h.tagline)}</p>
@@ -561,7 +653,10 @@ async function renderMe() {
         </div>
       </div>
       <div class="row"><input id="rename" placeholder="改暱稱（別人在開局清單看到的名字）" value="${esc(store.user.name)}"><button class="btn secondary small" id="rename-btn" style="flex:0 0 auto">改名</button></div>
-      <button class="btn secondary small" id="logout">登出</button>
+      <div style="display:flex;gap:8px">
+        <button class="btn secondary small" id="logout">登出</button>
+        ${store.user.isAdmin ? '<button class="btn secondary small" id="to-admin">🛠 管理頁</button>' : ''}
+      </div>
     </div>
 
     <div class="stats">
@@ -588,6 +683,7 @@ async function renderMe() {
     ${my.length ? my.slice(0, 20).map((x) => gameCard(x.g, me)).join('') : '<div class="empty">還沒打過，去「開局」記一場吧！</div>'}
   `;
   $('#logout').onclick = async () => { await store.signOut(); };
+  $('#to-admin')?.addEventListener('click', () => { go('admin'); window.scrollTo(0, 0); });
   $('#rename-btn').onclick = async () => {
     const name = $('#rename').value.trim();
     if (!name) return toast('暱稱不能空白');
@@ -651,8 +747,383 @@ async function renderRank() {
   bindDelete();
 }
 
+/* ---------- 頁面：管理（隱藏，網址 #admin，只有管理員能用） ---------- */
+const ADMIN_TABS = { heroes: '武將', upload: '上傳 JSON', admins: '管理員' };
+const field = (label, html) => `<label class="field"><span>${label}</span>${html}</label>`;
+const errorBox = (errs) => (errs.length
+  ? `<div class="errors">${errs.slice(0, 20).map((e) => `<div>⚠️ ${esc(e)}</div>`).join('')}${errs.length > 20 ? `<div>…還有 ${errs.length - 20} 個問題</div>` : ''}</div>`
+  : '');
+const saveErrorText = (e) => (e.code === 'permission-denied' ? '沒有權限（管理權限可能被移除了，請重新整理）' : e.code || e.message);
+
+async function saveHeroList(list) {
+  const bytes = new TextEncoder().encode(JSON.stringify(list)).length;
+  if (bytes > 950000) throw new Error(`資料太大（${Math.round(bytes / 1024)} KB），超過資料庫單份上限，需要拆開存`);
+  await store.saveHeroes(list);
+  state.heroes = list;
+  state.heroSource = 'db';
+}
+
+async function renderAdmin() {
+  if (!store.user) {
+    view.innerHTML = '<h2>管理頁</h2>' + loginBox('管理頁需要先登入。');
+    bindLogin();
+    return;
+  }
+  if (!store.user.isAdmin) {
+    view.innerHTML = `<h2>管理頁</h2><div class="card">
+      <p>你沒有管理權限。</p>
+      <p class="muted">需要的話，請把你的登入信箱給管理員，請他在管理頁把你加進名單，加好後重新整理這頁。</p>
+      ${store.user.email ? `<p class="muted">你的登入信箱：${esc(store.user.email)}</p>` : ''}
+    </div>`;
+    return;
+  }
+  const a = state.admin;
+  view.innerHTML = `
+    <h2>管理頁</h2>
+    <div class="chips">${Object.entries(ADMIN_TABS).map(([k, v]) => `<button class="chip atab ${k === a.tab ? 'on' : ''}" data-t="${k}">${v}</button>`).join('')}</div>
+    ${store.mode === 'local' ? '<p class="muted">本機模式：改動只存在這個瀏覽器，登入就有管理權限。</p>' : ''}
+    <div id="admin-box" style="margin-top:12px"></div>`;
+  $$('.atab').forEach((b) => {
+    b.onclick = () => { a.tab = b.dataset.t; a.editing = null; renderAdmin(); };
+  });
+  if (a.tab === 'heroes') renderAdminHeroes();
+  else if (a.tab === 'upload') renderAdminUpload();
+  else await renderAdminAdmins();
+}
+
+/* 管理頁：武將列表 */
+function renderAdminHeroes() {
+  const a = state.admin;
+  const box = $('#admin-box');
+  if (a.editing) { renderHeroForm(box); return; }
+  const src = state.heroSource === 'db' ? '管理頁存過的資料' : '預設檔 heroes.json（還沒在管理頁存過）';
+  box.innerHTML = `
+    <p class="muted" style="margin-top:0">共 ${state.heroes.length} 位，目前來源：${src}</p>
+    <div class="btn-row" style="margin-bottom:8px">
+      <button class="btn small" id="hero-add">＋ 新增武將</button>
+      <button class="btn secondary small" id="hero-dl">⬇ 下載 JSON</button>
+    </div>
+    <input id="admin-q" type="search" placeholder="搜尋要改的武將" value="${esc(a.q)}" autocomplete="off">
+    <div id="admin-hero-list" style="margin-top:8px"></div>`;
+
+  const drawList = () => {
+    const list = state.heroes.filter((h) => heroMatch(h, a.q.trim()));
+    const el = $('#admin-hero-list');
+    el.innerHTML = list.length
+      ? list.map((h) => `<div class="card admin-row">
+          <div class="faction ${esc(h.faction)}">${esc(h.faction)}</div>
+          <div style="flex:1;min-width:0">
+            <div class="ellipsis"><b>${esc(h.name)}</b> <span class="hero-sub">${esc(h.version)}・${esc(h.id)}</span></div>
+            <div class="muted ellipsis">${esc(h.tagline)}</div>
+          </div>
+          <button class="btn secondary small" data-edit="${esc(h.id)}" style="flex:0 0 auto">編輯</button>
+        </div>`).join('')
+      : '<div class="empty">找不到</div>';
+    $$('[data-edit]', el).forEach((b) => {
+      b.onclick = () => {
+        a.editing = structuredClone(state.heroes.find((h) => h.id === b.dataset.edit));
+        a.isNew = false;
+        renderAdminHeroes();
+        window.scrollTo(0, 0);
+      };
+    });
+  };
+  $('#admin-q').addEventListener('input', (e) => { a.q = e.target.value; drawList(); });
+  $('#hero-add').onclick = () => {
+    a.editing = normalizeHero({ version: '標準', faction: '蜀', hp: 4, difficulty: 1, skills: [{}] });
+    a.isNew = true;
+    renderAdminHeroes();
+    window.scrollTo(0, 0);
+  };
+  $('#hero-dl').onclick = downloadHeroes;
+  drawList();
+}
+
+function downloadHeroes() {
+  const blob = new Blob([JSON.stringify({ heroes: state.heroes }, null, 2) + '\n'], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = 'heroes.json';
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+/* 管理頁：單一武將編輯／新增 */
+function renderHeroForm(box) {
+  const a = state.admin;
+  const h = a.editing;
+  box.innerHTML = `
+    <div class="card">
+      <h3 style="margin-top:0">${a.isNew ? '新增武將' : '編輯：' + esc(h.name)}</h3>
+      ${field('id（英文代號，不能重複）', `<input id="f-id" value="${esc(h.id)}" ${a.isNew ? '' : 'disabled'} placeholder="例如 jie_guanyu" autocapitalize="off" autocomplete="off">`)}
+      ${field('名字', `<input id="f-name" value="${esc(h.name)}" placeholder="例如 界關羽">`)}
+      <div class="row">
+        ${field('版本', `<input id="f-version" value="${esc(h.version)}" placeholder="標準／界限突破…">`)}
+        ${field('稱號', `<input id="f-title" value="${esc(h.title)}" placeholder="可不填">`)}
+      </div>
+      <div class="row">
+        ${field('勢力', `<select id="f-faction">${FACTIONS.map((f) => `<option ${f === h.faction ? 'selected' : ''}>${f}</option>`).join('')}</select>`)}
+        ${field('血量', `<input id="f-hp" type="number" inputmode="numeric" min="1" max="10" value="${Number.isFinite(h.hp) ? h.hp : ''}">`)}
+        ${field('難度', `<select id="f-diff">${[1, 2, 3].map((n) => `<option value="${n}" ${n === h.difficulty ? 'selected' : ''}>${DIFF[n]}</option>`).join('')}</select>`)}
+      </div>
+      ${field('一句話定位', `<input id="f-tagline" value="${esc(h.tagline)}">`)}
+      ${field('別名（用頓號或逗號分隔）', `<input id="f-aliases" value="${esc(h.aliases.join('、'))}" placeholder="簡體字、俗稱、常見錯字">`)}
+      ${field('標籤（用頓號或逗號分隔）', `<input id="f-roles" value="${esc(h.roles.join('、'))}" placeholder="輸出、新手推薦">`)}
+    </div>
+    <h3>技能</h3>
+    ${h.skills.map((s, i) => `<div class="card skill-edit" data-i="${i}">
+        <div class="row">
+          <input class="s-name" value="${esc(s.name)}" placeholder="技能名">
+          <button class="btn danger small s-del" style="flex:0 0 auto">刪除技能</button>
+        </div>
+        <textarea class="s-plain" rows="3" placeholder="白話說明（用自己的話寫）">${esc(s.plain)}</textarea>
+        <div style="height:6px"></div>
+        <input class="s-tip" value="${esc(s.tip)}" placeholder="小技巧（可不填）">
+      </div>`).join('')}
+    <button class="btn secondary" id="s-add">＋ 新增技能</button>
+    <div id="f-errors"></div>
+    <div style="height:12px"></div>
+    <div class="btn-row">
+      <button class="btn secondary" id="f-cancel">取消</button>
+      <button class="btn" id="f-save">${a.isNew ? '新增' : '儲存'}</button>
+    </div>
+    ${a.isNew ? '' : '<div style="height:28px"></div><button class="btn danger" id="f-delete">刪除這個武將</button>'}
+    <div style="height:8px"></div>`;
+
+  // 把表單內容寫回 a.editing（新增／刪除技能重畫時才不會弄丟已輸入的字）
+  const readForm = () => {
+    if (a.isNew) h.id = $('#f-id').value.trim();
+    h.name = $('#f-name').value.trim();
+    h.version = $('#f-version').value.trim();
+    h.title = $('#f-title').value.trim();
+    h.faction = $('#f-faction').value;
+    h.hp = $('#f-hp').value === '' ? NaN : Number($('#f-hp').value);
+    h.difficulty = Number($('#f-diff').value);
+    h.tagline = $('#f-tagline').value.trim();
+    h.aliases = splitList($('#f-aliases').value);
+    h.roles = splitList($('#f-roles').value);
+    h.skills = $$('.skill-edit').map((el) => ({
+      name: $('.s-name', el).value.trim(), plain: $('.s-plain', el).value.trim(), tip: $('.s-tip', el).value.trim(),
+    }));
+  };
+
+  $('#s-add').onclick = () => { readForm(); h.skills.push({ name: '', plain: '', tip: '' }); renderHeroForm(box); };
+  $$('.s-del').forEach((b) => {
+    b.onclick = () => {
+      readForm();
+      h.skills.splice(+b.closest('.skill-edit').dataset.i, 1);
+      renderHeroForm(box);
+    };
+  });
+  $('#f-cancel').onclick = () => { a.editing = null; renderAdminHeroes(); };
+
+  $('#f-save').onclick = async () => {
+    readForm();
+    const hero = normalizeHero(h);
+    const others = state.heroes.filter((x) => a.isNew || x.id !== hero.id);
+    const errs = validateHero(hero);
+    if (others.some((x) => x.id === hero.id)) errs.push(`id「${hero.id}」已經有人用了`);
+    if (others.some((x) => x.name === hero.name)) errs.push(`名字「${hero.name}」跟其他武將重複`);
+    $('#f-errors').innerHTML = errorBox(errs);
+    if (errs.length) return;
+    const list = a.isNew ? [...state.heroes, hero] : state.heroes.map((x) => (x.id === hero.id ? hero : x));
+    const btn = $('#f-save');
+    btn.disabled = true;
+    try {
+      await saveHeroList(list);
+      toast(a.isNew ? `已新增 ${hero.name}` : `已儲存 ${hero.name}`);
+      a.editing = null;
+      renderAdminHeroes();
+    } catch (e) {
+      console.error(e);
+      toast('儲存失敗：' + saveErrorText(e));
+      btn.disabled = false;
+    }
+  };
+
+  $('#f-delete')?.addEventListener('click', async () => {
+    if (!confirm(`確定刪除「${h.name}」？\n（已經記錄的對局不受影響）`)) return;
+    try {
+      await saveHeroList(state.heroes.filter((x) => x.id !== h.id));
+      toast(`已刪除 ${h.name}`);
+      a.editing = null;
+      renderAdminHeroes();
+    } catch (e) {
+      console.error(e);
+      toast('刪除失敗：' + saveErrorText(e));
+    }
+  });
+}
+
+/* 管理頁：上傳 JSON */
+function renderAdminUpload() {
+  const u = state.admin.upload;
+  const box = $('#admin-box');
+  box.innerHTML = `
+    <div class="card">
+      <p class="muted" style="margin-top:0">選一個 .json 檔，或直接把內容貼到下面。格式可以是 <code>{"heroes": […]}</code> 或直接一個陣列 <code>[…]</code>，每位武將的欄位跟「下載 JSON」的一樣。</p>
+      <input type="file" id="up-file" accept=".json,application/json">
+      <div style="height:8px"></div>
+      <textarea id="up-text" rows="8" placeholder='{"heroes": [ … ]}' spellcheck="false" autocapitalize="off">${esc(u.text)}</textarea>
+      <h3>匯入方式</h3>
+      <div class="radio-group">
+        ${[['merge', '合併'], ['replace', '整份取代']].map(([v, l]) => `<label class="${u.mode === v ? 'on' : ''}"><input type="radio" name="up-mode" value="${v}" ${u.mode === v ? 'checked' : ''}>${l}</label>`).join('')}
+      </div>
+      <p class="muted">${u.mode === 'merge'
+        ? '合併：同 id 的武將會被檔案內容覆蓋，新的會加進來，其他的保留不動。'
+        : '整份取代：發布後只剩檔案裡的武將，<b>檔案裡沒有的會被刪掉</b>。'}</p>
+      <button class="btn secondary" id="up-check">檢查內容</button>
+    </div>
+    <div id="up-result"></div>`;
+
+  const clearResult = () => { $('#up-result').innerHTML = ''; };
+  $('#up-text').addEventListener('input', (e) => { u.text = e.target.value; clearResult(); });
+  $('#up-file').onchange = async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    u.text = await file.text();
+    $('#up-text').value = u.text;
+    clearResult();
+  };
+  $$('input[name=up-mode]').forEach((r) => { r.onchange = () => { u.mode = r.value; renderAdminUpload(); }; });
+
+  $('#up-check').onclick = () => {
+    const out = $('#up-result');
+    let data;
+    try {
+      data = JSON.parse(u.text);
+    } catch (e) {
+      out.innerHTML = `<div class="card">${errorBox([`JSON 格式錯誤：${e.message}`])}<p class="muted">常見原因：少了逗號、多了最後一個逗號、引號用到中文的「」或“”。</p></div>`;
+      return;
+    }
+    const incoming = Array.isArray(data) ? data : data?.heroes;
+    if (!Array.isArray(incoming) || !incoming.length) {
+      out.innerHTML = `<div class="card">${errorBox(['找不到武將清單：要有 "heroes": [ … ]，或整個檔案就是一個陣列'])}</div>`;
+      return;
+    }
+    const { errors, heroes } = validateHeroes(incoming);
+    if (errors.length) {
+      out.innerHTML = `<div class="card"><b>有 ${errors.length} 個問題，修好再檢查一次</b>${errorBox(errors)}</div>`;
+      return;
+    }
+
+    // 算出發布後的完整清單與差異
+    const cur = new Map(state.heroes.map((h) => [h.id, h]));
+    const inc = new Map(heroes.map((h) => [h.id, h]));
+    const added = heroes.filter((h) => !cur.has(h.id));
+    const changed = heroes.filter((h) => cur.has(h.id) && JSON.stringify(cur.get(h.id)) !== JSON.stringify(h));
+    const removed = u.mode === 'replace' ? state.heroes.filter((h) => !inc.has(h.id)) : [];
+    const final = u.mode === 'replace'
+      ? heroes
+      : [...state.heroes.map((h) => inc.get(h.id) || h), ...added];
+    // 合併後名字也不能重複
+    const seen = new Map();
+    const dup = [];
+    final.forEach((h) => { if (seen.has(h.name)) dup.push(`名字「${h.name}」重複（id：${seen.get(h.name)}、${h.id}）`); else seen.set(h.name, h.id); });
+    if (dup.length) {
+      out.innerHTML = `<div class="card"><b>合併後有名字重複</b>${errorBox(dup)}</div>`;
+      return;
+    }
+    const names = (arr) => arr.map((h) => esc(h.name)).join('、');
+    if (!added.length && !changed.length && !removed.length) {
+      out.innerHTML = '<div class="card">✅ 檢查通過，但內容跟目前一樣，不用發布。</div>';
+      return;
+    }
+    out.innerHTML = `<div class="card">
+      <b>✅ 檢查通過</b>
+      <p style="margin:6px 0">新增 ${added.length} 位、修改 ${changed.length} 位、刪除 ${removed.length} 位；發布後共 ${final.length} 位。</p>
+      ${added.length ? `<div class="muted">新增：${names(added)}</div>` : ''}
+      ${changed.length ? `<div class="muted">修改：${names(changed)}</div>` : ''}
+      ${removed.length ? `<div class="muted" style="color:var(--lose)">刪除：${names(removed)}</div>` : ''}
+      <div style="height:10px"></div>
+      <button class="btn" id="up-publish">確認發布</button>
+    </div>`;
+    $('#up-publish').onclick = async () => {
+      if (removed.length && !confirm(`會刪掉 ${removed.length} 位武將，確定要發布嗎？`)) return;
+      const btn = $('#up-publish');
+      btn.disabled = true;
+      try {
+        await saveHeroList(final);
+        u.text = '';
+        toast(`已發布，共 ${final.length} 位武將`);
+        state.admin.tab = 'heroes';
+        renderAdmin();
+      } catch (e) {
+        console.error(e);
+        toast('發布失敗：' + saveErrorText(e));
+        btn.disabled = false;
+      }
+    };
+  };
+}
+
+/* 管理頁：管理員名單 */
+async function renderAdminAdmins() {
+  const box = $('#admin-box');
+  box.innerHTML = '<div class="empty">載入中…</div>';
+  let admins;
+  try {
+    admins = (await store.listAdmins()).sort((x, y) => (x.addedAt || 0) - (y.addedAt || 0));
+  } catch (e) {
+    console.error(e);
+    box.innerHTML = `<div class="card">讀取名單失敗：${esc(saveErrorText(e))}</div>`;
+    return;
+  }
+  const me = store.user.email;
+  box.innerHTML = `
+    <div class="card">
+      <p class="muted" style="margin-top:0">名單上的 Google 信箱登入後就有管理權限，會在「我的」看到「管理頁」按鈕。</p>
+      <div class="row" style="margin-bottom:0">
+        <input id="ad-email" type="email" inputmode="email" autocapitalize="off" autocomplete="off" placeholder="對方的 Gmail，例如 friend@gmail.com">
+        <button class="btn small" id="ad-add" style="flex:0 0 auto">新增</button>
+      </div>
+    </div>
+    ${admins.map((x) => `<div class="card admin-row">
+        <div style="flex:1;min-width:0">
+          <div class="ellipsis"><b>${esc(x.email)}</b>${x.email === me ? ' <span class="badge">你</span>' : ''}</div>
+          <div class="muted">${x.addedBy && x.addedBy !== x.email ? `由 ${esc(x.addedBy)} 加入・` : ''}${x.addedAt ? fmtDate(x.addedAt) : ''}</div>
+        </div>
+        ${x.email === me ? '' : `<button class="btn danger small ad-del" data-e="${esc(x.email)}" style="flex:0 0 auto">移除</button>`}
+      </div>`).join('') || '<div class="empty">名單是空的</div>'}
+    <p class="muted">不能移除自己，避免最後沒有人能管理。</p>`;
+
+  const add = async () => {
+    const email = $('#ad-email').value.trim().toLowerCase();
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) { toast('信箱格式不對'); return; }
+    if (admins.some((x) => x.email === email)) { toast('已經在名單上了'); return; }
+    try {
+      await store.addAdmin(email);
+      toast(`已加入 ${email}`);
+      renderAdminAdmins();
+    } catch (e) {
+      console.error(e);
+      toast('新增失敗：' + saveErrorText(e));
+    }
+  };
+  $('#ad-add').onclick = add;
+  $('#ad-email').addEventListener('keydown', (e) => { if (e.key === 'Enter') add(); });
+  $$('.ad-del').forEach((b) => {
+    b.onclick = async () => {
+      const email = b.dataset.e;
+      if (!confirm(`確定移除 ${email} 的管理權限？`)) return;
+      try {
+        await store.removeAdmin(email);
+        toast(`已移除 ${email}`);
+        renderAdminAdmins();
+      } catch (e) {
+        console.error(e);
+        toast('移除失敗：' + saveErrorText(e));
+      }
+    };
+  });
+}
+
 /* ---------- 路由 ---------- */
-const PAGES = { heroes: renderHeroes, new: renderNew, me: renderMe, rank: renderRank };
+// admin 不在底部分頁列，只能從網址 #admin 或「我的」的管理頁按鈕進入
+const PAGES = { heroes: renderHeroes, new: renderNew, me: renderMe, rank: renderRank, admin: renderAdmin };
 
 function go(tab) {
   if (!PAGES[tab]) tab = 'heroes';
@@ -670,15 +1141,29 @@ async function render() {
   }
 }
 
-async function main() {
+// 先讀管理頁存過的武將資料，沒有（或讀不到）就用 data/heroes.json
+async function loadHeroes() {
+  let list = null;
   try {
-    const data = await (await fetch('data/heroes.json', { cache: 'no-cache' })).json();
-    state.heroes = data.heroes || data;
+    list = await store.loadHeroes();
   } catch (e) {
     console.error(e);
-    toast('武將資料載入失敗');
   }
+  state.heroSource = list ? 'db' : 'file';
+  if (!list) {
+    try {
+      const data = await (await fetch('data/heroes.json', { cache: 'no-cache' })).json();
+      list = data.heroes || data;
+    } catch (e) {
+      console.error(e);
+      toast('武將資料載入失敗');
+      list = [];
+    }
+  }
+  state.heroes = list.map(normalizeHero);
+}
 
+async function main() {
   const useFirebase = firebaseConfig.apiKey && firebaseConfig.apiKey !== 'PASTE_ME';
   try {
     store = useFirebase ? await createFirebaseStore() : createLocalStore();
@@ -687,9 +1172,15 @@ async function main() {
     store = createLocalStore();
     toast('Firebase 載入失敗，先用本機模式');
   }
+  await loadHeroes();
 
   $$('.tabbar button').forEach((b) => { b.onclick = () => { go(b.dataset.tab); window.scrollTo(0, 0); }; });
   state.tab = PAGES[location.hash.slice(1)] ? location.hash.slice(1) : 'heroes';
+  // 手動改網址的 #（例如打 #admin）也能切頁
+  window.addEventListener('hashchange', () => {
+    const t = location.hash.slice(1);
+    if (PAGES[t] && t !== state.tab) { state.tab = t; render(); }
+  });
 
   let started = false;
   await store.init(() => {
