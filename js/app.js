@@ -7,12 +7,30 @@ const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '
 const pct = (w, n) => (n ? Math.round((w / n) * 100) + '%' : '-');
 const view = $('#view');
 
-function toast(msg) {
+// action = { label, run }：例如「復原」，有動作的提示會停久一點
+function toast(msg, action) {
   const t = $('#toast');
   t.textContent = msg;
+  if (action) {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'toast-act';
+    b.textContent = action.label;
+    b.onclick = () => { t.classList.remove('show'); clearTimeout(toast._t); action.run(); };
+    t.append(b);
+  }
+  t.classList.toggle('has-action', !!action);
   t.classList.add('show');
   clearTimeout(toast._t);
-  toast._t = setTimeout(() => t.classList.remove('show'), 2200);
+  toast._t = setTimeout(() => t.classList.remove('show'), action ? 6000 : 2400);
+}
+// 把資料庫的錯誤代碼換成白話
+function errText(e) {
+  const code = e?.code || '';
+  if (code.includes('permission-denied')) return '沒有權限，可能登入過期了，重新整理後再試';
+  if (code.includes('unavailable') || code.includes('network') || !navigator.onLine) return '連不上資料庫，檢查網路後再試一次';
+  if (code.includes('unauthenticated')) return '登入過期了，請重新登入';
+  return e?.message || code || '發生未知錯誤';
 }
 const ls = {
   get(k, d) { try { return JSON.parse(localStorage.getItem(k)) ?? d; } catch { return d; } },
@@ -25,14 +43,38 @@ const SIDES = ['主公方', '反賊', '內奸'];
 // 人數 → [主公, 忠臣, 反賊, 內奸]
 const TABLE = { 4: [1, 1, 1, 1], 5: [1, 1, 2, 1], 6: [1, 1, 3, 1], 7: [1, 2, 3, 1], 8: [1, 2, 4, 1], 9: [1, 3, 4, 1], 10: [1, 3, 4, 2] };
 
-function identityList(n) {
-  const [a, b, c, d] = TABLE[n];
-  return [...Array(a).fill('主公'), ...Array(b).fill('忠臣'), ...Array(c).fill('反賊'), ...Array(d).fill('內奸')];
-}
 function countText(n) {
   const [a, b, c, d] = TABLE[n];
   return `${n} 人局：主公 ${a}、忠臣 ${b}、反賊 ${c}、內奸 ${d}`;
 }
+// 各方怎樣算贏（給新手看的白話版）
+const SIDE_GOAL = {
+  主公方: '主公＋忠臣：反賊和內奸都出局就贏',
+  反賊: '主公出局就贏',
+  內奸: '其他人都出局、最後單挑贏主公',
+};
+// 技能說明裡常見、新手看不懂的名詞（用自己的話寫的白話解釋）
+const GLOSSARY = [
+  ['殺', '基本牌。對攻擊範圍內一個人使用，對方沒出【閃】就扣 1 血。一般每回合只能出一張。'],
+  ['閃', '基本牌。有人對你出【殺】時打出來，這張【殺】就沒效。'],
+  ['桃', '基本牌。在自己回合可以回 1 血；有人快死時也能拿來救他。'],
+  ['決鬥', '錦囊牌。兩人輪流打出【殺】，先拿不出來的人扣 1 血。'],
+  ['無懈可擊', '錦囊牌。讓一張錦囊牌失效。'],
+  ['南蠻入侵', '錦囊牌。其他每個人都要打出一張【殺】，打不出就扣 1 血。'],
+  ['萬箭齊發', '錦囊牌。其他每個人都要打出一張【閃】，打不出就扣 1 血。'],
+  ['樂不思蜀', '延時錦囊。輪到對方時先翻一張牌，不是紅心的話，他這回合就不能出牌。'],
+  ['判定', '從牌堆頂翻一張牌，看花色或點數決定結果。'],
+  ['出牌階段', '你的回合裡可以出牌、發動技能的那段時間。'],
+  ['攻擊範圍', '【殺】打得到的距離。一開始是 1，裝備武器可以變遠。'],
+  ['主公技', '只有你當主公時才有的技能。'],
+  ['鎖定技', '一定會生效的技能，不能選擇不用。'],
+  ['限定技', '整局只能用一次的技能。'],
+  ['手牌', '拿在手上、別人看不到的牌。'],
+];
+function glossaryFor(text) {
+  return GLOSSARY.filter(([term]) => text.includes(term));
+}
+
 function isWin(identity, winner) {
   if (winner === '主公方') return identity === '主公' || identity === '忠臣';
   return identity === winner;
@@ -49,6 +91,8 @@ function shuffle(arr) {
 /* ---------- 武將資料：整理與檢查 ---------- */
 const FACTIONS = ['魏', '蜀', '吳', '群'];
 const DIFF = ['', '新手友善', '中等', '進階'];
+// 難度用中性的 ●○○ 刻度，不借勢力或身份的顏色
+const diffTag = (d) => (DIFF[d] ? `<span class="tag diff"><b aria-hidden="true">${'●'.repeat(d)}${'○'.repeat(3 - d)}</b>${DIFF[d]}</span>` : '');
 const str = (v) => (v == null ? '' : String(v)).trim();
 const strList = (v) => (Array.isArray(v) ? v.map(str).filter(Boolean) : []);
 const splitList = (s) => str(s).split(/[,，、\n]/).map((x) => x.trim()).filter(Boolean);
@@ -253,22 +297,40 @@ async function createFirebaseStore() {
 
 /* ---------- 狀態 ---------- */
 let store;
+const SEAT_CN = ['一', '二', '三', '四', '五', '六', '七', '八', '九', '十'];
+const ID_SHORT = { 主公: '主', 忠臣: '忠', 反賊: '反', 內奸: '內' };
+const STEPS = ['入座', '武將', '亮身份'];
+
 const state = {
   tab: 'heroes',
+  heroId: null, // 武將詳情頁（#heroes/<id>）
+  heroScroll: 0,
   heroes: [],
   q: '',
   faction: '全部',
-  openHero: null,
+  easyOnly: false,
   users: [],
   games: null,
   minGames: 1,
-  draft: ls.get('sgs_draft', null) || newDraft(5),
+  rankTab: 'players',
+  lastDraft: null, // 剛存的那局的草稿，撤銷時還原
+  draft: loadDraft(),
+  justSaved: null, // 剛存好的那局，顯示「已記錄」畫面
   heroSource: 'file', // 'db' = 管理頁存過的資料，'file' = data/heroes.json
   admin: { tab: 'heroes', q: '', editing: null, isNew: false, upload: { text: '', mode: 'merge' } },
 };
 
+// 身份預設「未定」，結算時才亮
 function newDraft(count) {
-  return { count, seats: identityList(count).map((identity) => ({ uid: '', name: '', hero: '', identity })), winner: '', note: '' };
+  return { count, step: 1, seats: Array.from({ length: count }, () => ({ uid: '', name: '', hero: '', identity: '' })), winner: '', note: '' };
+}
+// 讀回上次沒存完的開局（舊版草稿沒有 step，補成第 1 步）
+function loadDraft() {
+  const d = ls.get('sgs_draft', null);
+  if (!d || !TABLE[d.count] || !Array.isArray(d.seats) || d.seats.length !== d.count) return newDraft(5);
+  d.step = [1, 2, 3].includes(d.step) ? d.step : 1;
+  d.seats = d.seats.map((s) => ({ uid: str(s.uid), name: str(s.name), hero: str(s.hero), identity: IDENTITIES.includes(s.identity) ? s.identity : '' }));
+  return d;
 }
 const saveDraft = () => ls.set('sgs_draft', state.draft);
 const heroByName = (name) => {
@@ -277,6 +339,8 @@ const heroByName = (name) => {
   return state.heroes.find((h) => h.name === n || (h.aliases || []).includes(n)) || null;
 };
 const userName = (uid) => state.users.find((u) => u.uid === uid)?.name;
+const seatName = (s) => (s.uid === '__guest' ? s.name.trim() : userName(s.uid) || '');
+const seatFilled = (s) => !!s.uid && !!seatName(s);
 
 async function ensureData(force = false) {
   if (force || !state.games) {
@@ -287,14 +351,25 @@ async function ensureData(force = false) {
 }
 
 /* ---------- 共用元件 ---------- */
+const pctNum = (w, n) => (n ? Math.round((w / n) * 100) : 0);
+const pageHead = (title, extra = '') => `<div class="page-head"><h2>${title}</h2>${extra}</div>`;
+const seal = (f, cls = '') => `<span class="seal f-${esc(f)} ${cls}">${esc(f || '？')}</span>`;
+function hpHtml(hp) {
+  const n = Math.max(0, Math.min(10, hp | 0));
+  return `<span class="hp" role="img" aria-label="${n} 血">${'<i></i>'.repeat(n)}</span>`;
+}
+function avatarHtml(u, cls = '') {
+  if (u.photo) return `<img class="avatar ${cls}" src="${esc(u.photo)}" alt="" referrerpolicy="no-referrer">`;
+  return `<span class="avatar ${cls}">${esc((u.name || '？').slice(0, 1))}</span>`;
+}
+
 function renderUser() {
   const u = store.user;
   const badge = store.mode === 'local' ? '<span class="badge">本機模式</span>' : '';
   $('#user-area').innerHTML = u
-    ? `${badge}${u.photo ? `<img src="${esc(u.photo)}" alt="" referrerpolicy="no-referrer">` : ''}<span>${esc(u.name)}</span>`
-    : `${badge}<button class="btn small" id="top-login">登入</button>`;
-  const b = $('#top-login');
-  if (b) b.onclick = () => go('me');
+    ? `${badge}<button class="user-btn" id="top-me">${avatarHtml(u)}<span>${esc(u.name)}</span></button>`
+    : `${badge}<button class="btn small gold" id="top-login">登入</button>`;
+  ($('#top-login') || $('#top-me')).onclick = () => { go('me'); window.scrollTo(0, 0); };
 }
 
 function loginBox(msg) {
@@ -302,9 +377,9 @@ function loginBox(msg) {
     <p>${msg}</p>
     ${store.mode === 'local'
       ? `<p class="muted">目前是本機模式（還沒填 Firebase 設定），先用暱稱模擬登入，資料只存在這支手機。</p>
-         <input id="nick" placeholder="輸入暱稱"><div style="height:8px"></div>
+         <input id="nick" placeholder="輸入暱稱" aria-label="暱稱" maxlength="20"><div style="height:8px"></div>
          <button class="btn" id="login-btn">登入</button>`
-      : `<button class="btn" id="login-btn">用 Google 登入</button>`}
+      : '<button class="btn" id="login-btn">用 Google 登入</button>'}
   </div>`;
 }
 function bindLogin() {
@@ -326,224 +401,504 @@ function gameCard(g, meUid) {
   const mine = meUid ? g.seats.find((s) => s.uid === meUid) : null;
   const canDelete = store.user && g.createdBy === store.user.uid;
   return `<div class="card">
-    <div class="game-row">
-      <div><b>${fmtDate(g.createdAt)}</b> <span class="muted">${g.playerCount} 人・${esc(g.winner)}勝</span></div>
-      ${mine ? `<span class="${mine.win ? 'win' : 'lose'}">${mine.win ? '勝' : '負'}・${esc(mine.identity)}</span>` : ''}
+    <div class="game-top">
+      <span class="date">${fmtDate(g.createdAt)}</span>
+      <span class="muted">${g.playerCount} 人</span>
+      <span class="side-tag side-${esc(g.winner)}">${esc(g.winner)}勝</span>
+      ${mine ? `<span class="mine">${esc(mine.identity)}<span class="stamp ${mine.win ? '' : 'lose'}">${mine.win ? '勝' : '負'}</span></span>` : ''}
     </div>
-    <div class="game-seats">${g.seats.map((s) => `<span class="${s.win ? 'win' : ''}">${esc(s.uid ? userName(s.uid) || s.name : s.name)}</span>（${esc(s.identity)}${s.hero ? '／' + esc(s.hero) : ''}）`).join('、')}</div>
-    ${g.note ? `<div class="muted" style="margin-top:4px">📝 ${esc(g.note)}</div>` : ''}
-    ${canDelete ? `<div style="margin-top:8px;text-align:right"><button class="btn danger small del" data-id="${esc(g.id)}">刪除</button></div>` : ''}
+    <div class="seat-chips">${g.seats.map((s) => `<span class="schip id-${esc(s.identity)} ${s.win ? 'w' : ''}"><i>${ID_SHORT[s.identity] || '？'}</i><span>${esc(s.uid ? userName(s.uid) || s.name : s.name)}${s.hero ? ` <small>${esc(s.hero)}</small>` : ''}</span></span>`).join('')}</div>
+    ${g.note ? `<div class="game-note">「${esc(g.note)}」</div>` : ''}
+    ${canDelete ? `<details class="more"><summary>更多</summary><button class="btn danger small del" data-id="${esc(g.id)}" data-label="${esc(fmtDate(g.createdAt))}・${esc(g.winner)}勝">刪除這局</button></details>` : ''}
   </div>`;
 }
 function bindDelete() {
   $$('.del').forEach((b) => {
     b.onclick = async () => {
-      if (!confirm('確定刪除這局紀錄？')) return;
+      if (!confirm(`確定刪除 ${b.dataset.label} 這一局？刪除後所有人的戰績都會少掉這局，不能復原。`)) return;
+      b.disabled = true;
       try {
         await store.deleteGame(b.dataset.id);
         state.games = null;
-        toast('已刪除');
+        toast('已刪除這局');
         render();
-      } catch (e) { console.error(e); toast('刪除失敗'); }
+      } catch (e) { console.error(e); toast('刪除失敗：' + errText(e)); b.disabled = false; }
     };
   });
+}
+
+// 一局的結果列表（開局結算預覽、存好後的畫面共用）
+function resultList(seats) {
+  return `<div class="result-list">${seats.map((s, i) => `<div class="result-row ${s.win ? '' : 'lost'}">
+      <span class="no">${SEAT_CN[i]}</span>
+      <span class="who"><b>${esc(s.name || '（未填）')}</b>${s.hero ? `<small>${esc(s.hero)}</small>` : ''}</span>
+      <span class="idtag id-${esc(s.identity)}">${esc(s.identity)}</span>
+      <span class="stamp ${s.win ? '' : 'lose'}">${s.win ? '勝' : '負'}</span>
+    </div>`).join('')}</div>`;
 }
 
 /* ---------- 頁面：武將 ---------- */
 function heroMatch(h, q) {
   if (!q) return true;
   q = q.toLowerCase();
-  return [h.name, h.title, h.version, ...(h.aliases || [])].some((s) => s && s.toLowerCase().includes(q));
+  return [h.name, h.title, h.version, ...(h.aliases || []), ...(h.skills || []).map((s) => s.name)].some((s) => s && s.toLowerCase().includes(q));
 }
-function heroCard(h) {
-  const open = state.openHero === h.id;
-  const diff = DIFF[h.difficulty] || '';
-  const hp = Math.max(0, Math.min(10, h.hp | 0));
-  return `<div class="card clickable" data-hero="${esc(h.id)}">
-    <div class="hero-head">
-      <div class="faction ${esc(h.faction)}">${esc(h.faction)}</div>
-      <div>
-        <div class="hero-name">${esc(h.name)} <span class="hero-sub">${esc(h.version)}・${esc(h.title || '')}</span></div>
-        <div class="hp">${'●'.repeat(hp)} <span class="hero-sub">${hp} 血</span></div>
-      </div>
-    </div>
-    <p class="tagline">${esc(h.tagline)}</p>
-    <div class="chips"><span class="chip hard${h.difficulty}">${diff}</span>${(h.roles || []).map((r) => `<span class="chip">${esc(r)}</span>`).join('')}</div>
-    ${open
-      ? `<div class="hero-body">
-          ${h.skills.map((s) => `<div class="skill"><b>【${esc(s.name)}】</b>${esc(s.plain)}${s.tip ? `<div class="tip">💡 ${esc(s.tip)}</div>` : ''}</div>`).join('')}
-          ${h.aliases?.length ? `<div class="muted">也叫：${h.aliases.map(esc).join('、')}</div>` : ''}
-        </div>`
-      : '<div class="muted" style="margin-top:6px">點開看技能白話翻譯 ▾</div>'}
-  </div>`;
+function filteredHeroes() {
+  const q = state.q.trim();
+  return state.heroes.filter((h) => (state.faction === '全部' || h.faction === state.faction)
+    && (!state.easyOnly || h.difficulty === 1)
+    && heroMatch(h, q));
+}
+function heroTile(h) {
+  return `<a class="hcard f-${esc(h.faction)}" href="#heroes/${encodeURIComponent(h.id)}">
+    <div class="hcard-top">${seal(h.faction)}<div class="hcard-name"><b>${esc(h.name)}</b><span>${esc(h.version)}${h.title ? '・' + esc(h.title) : ''}</span></div></div>
+    ${hpHtml(h.hp)}
+    <p class="hcard-tag">${esc(h.tagline)}</p>
+    <div class="hcard-foot">${diffTag(h.difficulty)}</div>
+  </a>`;
 }
 function renderHeroList() {
-  const q = state.q.trim();
-  const list = state.heroes.filter((h) => (state.faction === '全部' || h.faction === state.faction) && heroMatch(h, q));
+  const list = filteredHeroes();
   const box = $('#hero-list-box');
-  box.innerHTML = list.length ? list.map(heroCard).join('') : '<div class="empty">找不到這個武將，試試別名或少打幾個字</div>';
-  $$('[data-hero]', box).forEach((el) => {
-    el.onclick = () => {
-      state.openHero = state.openHero === el.dataset.hero ? null : el.dataset.hero;
+  const q = state.q.trim();
+  const filtered = state.faction !== '全部' || state.easyOnly;
+  const filterName = [state.faction !== '全部' ? state.faction : '', state.easyOnly ? '新手友善' : ''].filter(Boolean).join('＋');
+  const hiddenByFilter = filtered && state.heroes.some((h) => heroMatch(h, q));
+  box.innerHTML = list.length
+    ? list.map(heroTile).join('')
+    : `<div class="empty" style="grid-column:1/-1">${hiddenByFilter
+      ? `「${esc(filterName)}」裡沒有${q ? `「${esc(q)}」` : '武將'}。<br><button class="link-btn clear-filter">改看全部武將</button>`
+      : `找不到「${esc(q)}」。試試別名、簡體字，或少打幾個字`}</div>`;
+  $('#hero-count').innerHTML = filtered
+    ? `顯示 ${list.length}／${state.heroes.length} 位（${esc(filterName)}）<button class="link-btn clear-filter">清除篩選</button>`
+    : `${list.length} 位`;
+  $$('.clear-filter').forEach((b) => {
+    b.onclick = () => {
+      state.faction = '全部';
+      state.easyOnly = false;
+      $$('.fbtn').forEach((x) => { x.classList.toggle('on', x.dataset.f === '全部'); x.setAttribute('aria-pressed', x.dataset.f === '全部'); });
+      $('#easy').classList.remove('on');
+      $('#easy').setAttribute('aria-pressed', 'false');
       renderHeroList();
     };
   });
+  // 記下捲動位置，從詳情頁回來時回到原處
+  $$('.hcard', box).forEach((a) => { a.addEventListener('click', () => { state.heroScroll = window.scrollY; }); });
 }
 function renderHeroes() {
-  const factions = ['全部', '魏', '蜀', '吳', '群'];
+  if (state.heroId) { renderHeroDetail(); return; }
+  const factions = ['全部', ...FACTIONS];
   view.innerHTML = `
-    <div class="search">
-      <input id="q" type="search" placeholder="搜尋武將：關羽、謀關羽、界關羽…" value="${esc(state.q)}" autocomplete="off">
-      <div class="chips">${factions.map((f) => `<button class="chip fbtn ${f === state.faction ? 'on' : ''}" data-f="${f}">${f}</button>`).join('')}</div>
+    ${pageHead('武將圖鑑')}
+    <div class="filters">
+      <input id="q" type="search" enterkeyhint="search" aria-label="搜尋武將" placeholder="搜尋武將：關羽、謀關羽、界關羽…" value="${esc(state.q)}" autocomplete="off">
+      <div class="chips scroll-x" role="group" aria-label="篩選">
+        ${factions.map((f) => `<button class="chip fbtn f-${f} ${f === state.faction ? 'on' : ''}" data-f="${f}" aria-pressed="${f === state.faction}">${f === '全部' ? '' : '<span class="dot"></span>'}${f}</button>`).join('')}
+        <button class="chip ${state.easyOnly ? 'on' : ''}" id="easy" aria-pressed="${state.easyOnly}">新手友善</button>
+      </div>
     </div>
-    <div id="hero-list-box"></div>`;
-  $('#q').addEventListener('input', (e) => {
-    state.q = e.target.value;
-    // 只有一筆結果就自動展開
-    const hits = state.heroes.filter((h) => heroMatch(h, state.q.trim()));
-    if (state.q.trim() && hits.length === 1) state.openHero = hits[0].id;
-    renderHeroList();
+    <p class="muted" style="margin:-4px 0 10px" id="hero-count"></p>
+    <div id="hero-list-box" class="hgrid"></div>`;
+  $('#q').addEventListener('input', (e) => { state.q = e.target.value; renderHeroList(); });
+  // 只剩一位時按 Enter 直接打開
+  $('#q').addEventListener('keydown', (e) => {
+    if (e.key !== 'Enter') return;
+    const list = filteredHeroes();
+    if (list.length === 1) location.hash = 'heroes/' + encodeURIComponent(list[0].id);
   });
   $$('.fbtn').forEach((b) => {
     b.onclick = () => {
       state.faction = b.dataset.f;
-      $$('.fbtn').forEach((x) => x.classList.toggle('on', x === b));
+      $$('.fbtn').forEach((x) => { x.classList.toggle('on', x === b); x.setAttribute('aria-pressed', x === b); });
       renderHeroList();
     };
   });
+  $('#easy').onclick = (e) => {
+    state.easyOnly = !state.easyOnly;
+    e.currentTarget.classList.toggle('on', state.easyOnly);
+    e.currentTarget.setAttribute('aria-pressed', state.easyOnly);
+    renderHeroList();
+  };
   renderHeroList();
 }
+function renderHeroDetail() {
+  const h = state.heroes.find((x) => x.id === state.heroId);
+  if (!h) {
+    view.innerHTML = '<a class="back" href="#heroes">‹ 武將圖鑑</a><div class="empty">找不到這位武將，可能已經被移除了</div>';
+    return;
+  }
+  view.innerHTML = `
+    <a class="back" href="#heroes" id="back">‹ 武將圖鑑</a>
+    <article class="hdetail f-${esc(h.faction)}">
+      <header class="hd-head">
+        ${seal(h.faction, 'big')}
+        <div style="min-width:0">
+          <div class="hd-ver">${esc(h.version)}${h.title ? '・' + esc(h.title) : ''}</div>
+          <h2 class="hd-name">${esc(h.name)}</h2>
+          <div class="hd-hp">${hpHtml(h.hp)}<span>${h.hp | 0} 血</span></div>
+        </div>
+      </header>
+      <div class="hd-body">
+        <p class="hd-tag">${esc(h.tagline)}</p>
+        <div class="chips">${diffTag(h.difficulty)}${(h.roles || []).filter((r) => !(h.difficulty === 1 && r === '新手推薦')).map((r) => `<span class="tag">${esc(r)}</span>`).join('')}</div>
+      </div>
+    </article>
+    <div class="sec">技能<span class="muted">白話翻譯</span></div>
+    ${h.skills.map((s) => `<section class="skill">
+        <h3 class="skill-name">${esc(s.name)}</h3>
+        <p>${esc(s.plain)}</p>
+        ${s.tip ? `<div class="tip"><b>訣竅</b>${esc(s.tip)}</div>` : ''}
+      </section>`).join('')}
+    ${(() => {
+      const terms = glossaryFor([h.tagline, ...h.skills.flatMap((s) => [s.plain, s.tip])].join(' '));
+      return terms.length ? `<details class="card glossary">
+        <summary>看不懂的名詞：${terms.map(([t]) => esc(t)).join('、')}</summary>
+        <dl>${terms.map(([t, d]) => `<dt>${esc(t)}</dt><dd>${esc(d)}</dd>`).join('')}</dl>
+      </details>` : '';
+    })()}
+    ${h.aliases?.length ? `<p class="muted aliases">也叫：${h.aliases.map(esc).join('、')}</p>` : ''}`;
+  // 從列表點進來的就用瀏覽器返回，列表會停在原本的位置
+  $('#back').onclick = (e) => {
+    if (state.cameFromList) { e.preventDefault(); history.back(); }
+  };
+}
 
-/* ---------- 頁面：開局 ---------- */
-function seatHtml(s, i) {
-  const me = store.user.uid;
-  const opts = state.users
-    .map((u) => `<option value="${esc(u.uid)}" ${s.uid === u.uid ? 'selected' : ''}>${esc(u.name)}${u.uid === me ? '（我）' : ''}</option>`)
-    .join('');
-  const h = heroByName(s.hero);
-  return `<div class="seat identity-${s.identity}" data-i="${i}">
-    <div class="row">
-      <span class="n">${i + 1}</span>
-      <select class="who"><option value="">選玩家</option>${opts}<option value="__guest" ${s.uid === '__guest' ? 'selected' : ''}>＋ 訪客</option></select>
-      <select class="identity">${IDENTITIES.map((x) => `<option ${x === s.identity ? 'selected' : ''}>${x}</option>`).join('')}</select>
-    </div>
-    ${s.uid === '__guest' ? `<div class="row"><span class="n"></span><input class="gname" placeholder="訪客名字" value="${esc(s.name)}"></div>` : ''}
-    <div class="row"><span class="n"></span><input class="hero" list="hero-dl" placeholder="武將（可打別名）" value="${esc(s.hero)}"></div>
-    <div class="hero-hint muted" style="margin-left:36px">${h ? `${esc(h.faction)}・${esc(h.tagline)}` : ''}</div>
+/* ---------- 頁面：開局（三步驟：入座 → 武將 → 亮身份） ---------- */
+// 實體身份局裡身份要到最後才亮，所以開打前只記座位和武將，身份在結算時才填。
+function stepper(step) {
+  return `<ol class="stepper">${STEPS.map((t, i) => {
+    const n = i + 1;
+    const cls = n < step ? 'done' : n === step ? 'cur' : '';
+    const inner = `<span>${n}</span>${t}`;
+    return `<li class="${cls}">${n < step
+      ? `<button type="button" data-step="${n}" aria-label="回到第 ${n} 步：${t}">${inner}</button>`
+      : `<div ${n === step ? 'aria-current="step"' : ''}>${inner}</div>`}</li>`;
+  }).join('')}</ol>`;
+}
+// 固定在分頁列上方的主要按鈕，內容再長都按得到
+const actionBar = (prev, next, disabled = false) => `<div class="actionbar ${prev ? 'two' : ''}">
+    ${prev ? `<button class="btn secondary" id="prev">${prev}</button>` : ''}
+    <button class="btn" id="next" ${disabled ? 'disabled' : ''}>${next}</button>
   </div>`;
+
+function setStep(n) {
+  state.draft.step = n;
+  saveDraft();
+  renderNew();
+  window.scrollTo(0, 0);
 }
-function seatLabel(s, i) {
-  const n = s.uid === '__guest' ? s.name : userName(s.uid);
-  return `${i + 1}號${n ? ' ' + n : ''}`;
+// 重畫但留在原本的捲動位置（點身份、選獲勝方時用）
+function rerenderKeepScroll() {
+  const y = window.scrollY;
+  renderNew().then(() => window.scrollTo(0, y));
 }
-function winnerHint(d) {
-  if (!d.winner) return '選了之後會自動算出每個人勝負。';
-  const w = d.seats.map((s, i) => (isWin(s.identity, d.winner) ? seatLabel(s, i) : null)).filter(Boolean);
-  return w.length ? `贏家：${w.join('、')}` : '⚠️ 沒有人是這個陣營，確認一下身份';
+// 各身份目前人數 vs 標準配置
+function identityCheck(d) {
+  const need = TABLE[d.count];
+  return IDENTITIES.map((id, i) => ({ id, need: need[i], have: d.seats.filter((s) => s.identity === id).length }));
+}
+function sideMembers(d, side) {
+  return d.seats.map((s, i) => (s.identity && isWin(s.identity, side) ? `${SEAT_CN[i]}・${seatName(s)}` : null)).filter(Boolean);
+}
+// 最近用過的訪客名字，下次直接出現在玩家清單
+const recentGuests = () => ls.get('sgs_guests', []);
+function rememberGuests(names) {
+  const list = [...new Set([...names, ...recentGuests()])].slice(0, 12);
+  ls.set('sgs_guests', list);
 }
 
 async function renderNew() {
   if (!store.user) {
-    view.innerHTML = '<h2>開一局身份局</h2>' + loginBox('登入後才能記錄對局。');
+    view.innerHTML = pageHead('開局') + loginBox('登入後才能記錄對局。');
     bindLogin();
     return;
   }
-  if (!state.games) view.innerHTML = '<div class="empty">載入中…</div>';
+  if (!state.games) view.innerHTML = '<div class="empty">正在讀取玩家名單…</div>';
   await ensureData();
+  if (state.justSaved) { renderSaved(); return; }
+
   const d = state.draft;
-  view.innerHTML = `
-    <h2>開一局身份局</h2>
+  if (d.step > 1 && !d.seats.every(seatFilled)) d.step = 1;
+  const body = d.step === 1 ? newStep1(d) : d.step === 2 ? newStep2(d) : newStep3(d);
+  view.innerHTML = pageHead('開局') + stepper(d.step) + body;
+  $$('.stepper [data-step]').forEach((b) => { b.onclick = () => setStep(+b.dataset.step); });
+  if (d.step === 1) bindStep1(d);
+  else if (d.step === 2) bindStep2(d);
+  else bindStep3(d);
+}
+
+/* 第 1 步：人數 + 入座 */
+function newStep1(d) {
+  const me = store.user.uid;
+  const seated = new Set(d.seats.map((s) => s.uid).filter((u) => u && u !== '__guest'));
+  const seatedGuests = new Set(d.seats.filter((s) => s.uid === '__guest').map((s) => s.name.trim()));
+  // 常一起玩的人排前面
+  const freq = new Map();
+  for (const g of state.games) for (const s of g.seats) if (s.uid) freq.set(s.uid, (freq.get(s.uid) || 0) + 1);
+  const pool = state.users
+    .filter((u) => !seated.has(u.uid))
+    .sort((a, b) => (b.uid === me) - (a.uid === me) || (freq.get(b.uid) || 0) - (freq.get(a.uid) || 0) || a.name.localeCompare(b.name, 'zh-Hant'));
+  const guests = recentGuests().filter((n) => !seatedGuests.has(n));
+  const firstEmpty = d.seats.findIndex((s) => !seatFilled(s));
+  const filled = d.seats.filter(seatFilled).length;
+
+  return `
     <div class="card">
-      <div class="row"><span style="flex:0 0 auto">人數</span>
-        <select id="count">${Object.keys(TABLE).map((n) => `<option value="${n}" ${+n === d.count ? 'selected' : ''}>${n} 人</option>`).join('')}</select>
+      <div class="label" id="count-label">幾個人玩？</div>
+      <div class="seg count" role="group" aria-labelledby="count-label">${Object.keys(TABLE).map((n) => `<button data-n="${n}" class="${+n === d.count ? 'on' : ''}" aria-pressed="${+n === d.count}">${n}</button>`).join('')}</div>
+      <p class="muted" style="margin:8px 0 0">${countText(d.count)}</p>
+    </div>
+    <div class="card">
+      <div class="label-row"><span class="label">座位 ${filled}/${d.count}</span>${filled ? '<button class="link-btn" id="clear-seats">全部清空</button>' : ''}</div>
+      <div class="seat-grid">${d.seats.map((s, i) => {
+        const on = seatFilled(s);
+        return `<button class="seat-slot ${on ? 'on' : ''} ${i === firstEmpty ? 'next' : ''}" data-i="${i}" ${on ? `aria-label="${SEAT_CN[i]}號位 ${esc(seatName(s))}，點一下移除"` : 'disabled'}>
+          <span class="no">${SEAT_CN[i]}</span><span class="nm">${on ? esc(seatName(s)) : i === firstEmpty ? '下一位' : '空位'}</span>${on ? '<span class="x" aria-hidden="true">×</span>' : ''}
+        </button>`;
+      }).join('')}</div>
+      <p class="muted" style="margin:8px 0 0">依座位順序點下面的玩家；點已入座的人可以移除。</p>
+    </div>
+    <div class="card">
+      <div class="label">玩家</div>
+      <div class="pool">
+        ${pool.map((u) => `<button class="pchip ${u.uid === me ? 'me' : ''}" data-uid="${esc(u.uid)}">${esc(u.name)}${u.uid === me ? '（我）' : ''}</button>`).join('')}
+        ${guests.map((n) => `<button class="pchip guest" data-guest="${esc(n)}">${esc(n)}<small>訪客</small></button>`).join('')}
+        ${!pool.length && !guests.length ? '<span class="muted">大家都入座了</span>' : ''}
       </div>
-      <p class="muted" style="margin:0 0 10px">${countText(d.count)}</p>
-      <div class="btn-row">
-        <button class="btn secondary small" id="rand-id">🎲 隨機身份</button>
-        <button class="btn secondary small" id="rand-hero">🎲 隨機武將</button>
-        <button class="btn secondary small" id="reset">清空</button>
+      <div class="row" style="margin:0">
+        <input id="guest" placeholder="沒帳號的朋友：輸入名字" aria-label="訪客名字" maxlength="20" autocomplete="off" enterkeyhint="done">
+        <button class="btn small" id="add-guest" style="flex:0 0 auto">入座</button>
       </div>
     </div>
-    <h3>座位（主公坐 1 號位最順）</h3>
-    ${d.seats.map(seatHtml).join('')}
-    <datalist id="hero-dl">${state.heroes.map((h) => `<option value="${esc(h.name)}">`).join('')}</datalist>
-    <h3>誰贏了？</h3>
-    <div class="radio-group">${SIDES.map((w) => `<label class="${d.winner === w ? 'on' : ''}"><input type="radio" name="winner" value="${w}" ${d.winner === w ? 'checked' : ''}>${w}</label>`).join('')}</div>
-    <p class="muted" id="winner-hint">${esc(winnerHint(d))}</p>
-    <textarea id="note" rows="2" placeholder="備註（可不填），例如：內奸單挑主公翻盤">${esc(d.note || '')}</textarea>
-    <div style="height:12px"></div>
-    <button class="btn" id="save">儲存這局</button>
-    <div style="height:8px"></div>`;
-
-  const refreshHint = () => { $('#winner-hint').textContent = winnerHint(d); saveDraft(); };
-
-  $('#count').onchange = (e) => {
-    const n = +e.target.value;
-    const old = d.seats;
-    state.draft = newDraft(n);
-    state.draft.seats.forEach((s, i) => { if (old[i]) { s.uid = old[i].uid; s.name = old[i].name; s.hero = old[i].hero; } });
+    ${actionBar(null, filled === d.count ? '下一步：選武將 ›' : `還有 ${d.count - filled} 個空位`, filled !== d.count)}`;
+}
+function bindStep1(d) {
+  const fill = (seat) => {
+    const i = d.seats.findIndex((s) => !seatFilled(s));
+    if (i < 0) { toast('座位滿了，先點座位移除某人'); return; }
+    Object.assign(d.seats[i], seat);
     saveDraft();
-    renderNew();
+    rerenderKeepScroll();
   };
-  $('#rand-id').onclick = () => {
-    shuffle(identityList(d.count)).forEach((id, i) => { d.seats[i].identity = id; });
+  $$('.seg.count button').forEach((b) => {
+    b.onclick = () => {
+      const old = d.seats;
+      const next = newDraft(+b.dataset.n);
+      next.seats.forEach((s, i) => { if (old[i]) { s.uid = old[i].uid; s.name = old[i].name; s.hero = old[i].hero; } });
+      state.draft = next;
+      saveDraft();
+      rerenderKeepScroll();
+    };
+  });
+  // 移除和清空都可以在 6 秒內復原（單手誤觸很常見）
+  const undoable = (msg, change) => {
+    const before = structuredClone(d.seats);
+    change();
     saveDraft();
-    renderNew();
+    rerenderKeepScroll();
+    toast(msg, { label: '復原', run: () => {
+      if (state.draft !== d) return;
+      d.seats = before;
+      saveDraft();
+      rerenderKeepScroll();
+    } });
   };
+  $$('.seat-slot.on').forEach((b) => {
+    b.onclick = () => {
+      const s = d.seats[+b.dataset.i];
+      const name = seatName(s);
+      undoable(`已把 ${name} 移出座位`, () => Object.assign(s, { uid: '', name: '', hero: '', identity: '' }));
+    };
+  });
+  $$('.pchip[data-uid]').forEach((b) => { b.onclick = () => fill({ uid: b.dataset.uid, name: '' }); });
+  $$('.pchip[data-guest]').forEach((b) => { b.onclick = () => fill({ uid: '__guest', name: b.dataset.guest }); });
+  const addGuest = () => {
+    const name = $('#guest').value.trim();
+    if (!name) { toast('請先輸入名字'); return; }
+    if (d.seats.some((s) => seatFilled(s) && seatName(s) === name)) { toast(`「${name}」已經在座位上了`); return; }
+    fill({ uid: '__guest', name });
+  };
+  $('#add-guest').onclick = addGuest;
+  $('#guest').addEventListener('keydown', (e) => { if (e.key === 'Enter') addGuest(); });
+  $('#clear-seats')?.addEventListener('click', () => {
+    undoable('座位已全部清空', () => d.seats.forEach((s) => Object.assign(s, { uid: '', name: '', hero: '', identity: '' })));
+  });
+  $('#next').onclick = () => setStep(2);
+}
+
+/* 第 2 步：武將（公開資訊，開打前記） */
+function heroPickLabel(s) {
+  const h = heroByName(s.hero);
+  if (h) return `${seal(h.faction, 'sm')}<span>${esc(h.name)}</span>`;
+  if (s.hero) return `<span class="seal sm unknown" aria-hidden="true">？</span><span>${esc(s.hero)}</span>`;
+  return '<span class="pick-empty">選武將</span>';
+}
+function newStep2(d) {
+  return `
+    <div class="label-row"><span class="label">每個人拿哪位武將？</span><button class="link-btn" id="rand-hero">隨機抽武將</button></div>
+    <div class="card seat-list">${d.seats.map((s, i) => `<div class="hero-seat">
+        <span class="no">${SEAT_CN[i]}</span>
+        <span class="nm">${esc(seatName(s))}</span>
+        <button class="hero-pick ${s.hero ? 'on' : ''}" data-i="${i}" aria-label="${SEAT_CN[i]}號位 ${esc(seatName(s))} 的武將：${s.hero ? esc(s.hero) : '還沒選'}">${heroPickLabel(s)}</button>
+      </div>`).join('')}</div>
+    <p class="muted">武將可以不填。身份等打完再亮，下一步才記。</p>
+    ${actionBar('‹ 上一步', '開打！')}`;
+}
+function bindStep2(d) {
+  $$('.hero-pick').forEach((b) => { b.onclick = () => openHeroSheet(d, +b.dataset.i); });
   $('#rand-hero').onclick = () => {
     const pool = shuffle(state.heroes.filter((h) => h.difficulty <= 2));
-    d.seats.forEach((s, i) => { s.hero = pool[i % pool.length]?.name || ''; });
+    if (!pool.length) { toast('圖鑑裡沒有可以抽的武將'); return; }
+    d.seats.forEach((s, i) => { s.hero = pool[i % pool.length].name; });
     saveDraft();
     renderNew();
-    toast('已幫每人抽一隻（排除進階武將）');
+    toast('已幫每人抽一位（排除進階武將）');
   };
-  $('#reset').onclick = () => {
-    if (!confirm('清空這局的所有欄位？')) return;
-    state.draft = newDraft(d.count);
+  $('#prev').onclick = () => setStep(1);
+  $('#next').onclick = () => setStep(3);
+}
+
+// 從底部彈出的武將選單：印章格子、可搜尋、可依勢力篩選
+function openHeroSheet(d, i) {
+  const s = d.seats[i];
+  let q = '';
+  let f = '全部';
+  const wrap = document.createElement('div');
+  wrap.className = 'sheet-wrap';
+  wrap.innerHTML = `
+    <div class="sheet" role="dialog" aria-modal="true" aria-labelledby="sheet-title" tabindex="-1">
+      <div class="sheet-head">
+        <b id="sheet-title">${SEAT_CN[i]}號位・${esc(seatName(s))}</b>
+        <button class="link-btn" data-close>關閉</button>
+      </div>
+      <input type="search" id="sheet-q" placeholder="搜尋武將或別名" aria-label="搜尋武將" autocomplete="off" enterkeyhint="search">
+      <div class="chips scroll-x" role="group" aria-label="勢力">${['全部', ...FACTIONS].map((x) => `<button class="chip f-${x} ${x === f ? 'on' : ''}" data-f="${x}" aria-pressed="${x === f}">${x === '全部' ? '' : '<span class="dot"></span>'}${x}</button>`).join('')}</div>
+      <div class="sheet-grid" id="sheet-grid"></div>
+      ${s.hero ? '<button class="btn secondary" id="sheet-clear">清除這位的武將</button>' : ''}
+    </div>`;
+  document.body.appendChild(wrap);
+  document.body.classList.add('sheet-open');
+  const sheet = $('.sheet', wrap);
+  const grid = $('#sheet-grid', wrap);
+
+  const close = () => {
+    wrap.remove();
+    document.body.classList.remove('sheet-open');
+    document.removeEventListener('keydown', onKey);
+    $(`.hero-pick[data-i="${i}"]`)?.focus();
+  };
+  const choose = (name) => {
+    s.hero = name;
     saveDraft();
-    renderNew();
+    close();
+    renderNew().then(() => $(`.hero-pick[data-i="${i}"]`)?.focus());
+  };
+  const onKey = (e) => {
+    if (e.key === 'Escape') { close(); return; }
+    if (e.key !== 'Tab') return;
+    const items = $$('button, input', sheet).filter((x) => x.offsetParent !== null);
+    const first = items[0];
+    const last = items[items.length - 1];
+    if (e.shiftKey && (document.activeElement === first || document.activeElement === sheet)) { e.preventDefault(); last.focus(); }
+    else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+  };
+  const draw = () => {
+    const query = q.trim();
+    const list = state.heroes.filter((h) => (f === '全部' || h.faction === f) && heroMatch(h, query));
+    const exact = list.some((h) => h.name === query || h.aliases.includes(query));
+    grid.innerHTML = list.map((h) => `<button class="pick f-${esc(h.faction)} ${heroByName(s.hero)?.id === h.id ? 'on' : ''}" data-name="${esc(h.name)}">
+        ${seal(h.faction, 'sm')}<span><b>${esc(h.name)}</b><small>${esc(h.version)}</small></span></button>`).join('')
+      + (query && !exact
+        ? `<button class="pick free" data-name="${esc(query)}"><span class="seal sm unknown" aria-hidden="true">？</span><span><b>就用「${esc(query)}」</b><small>圖鑑裡沒有，統計會照這個名字記</small></span></button>`
+        : '')
+      || `<div class="empty">這個勢力還沒有武將，換一個勢力看看</div>`;
+    $$('.pick', grid).forEach((b) => { b.onclick = () => choose(b.dataset.name); });
   };
 
-  $$('.seat').forEach((el) => {
-    const s = d.seats[+el.dataset.i];
-    $('.who', el).onchange = (e) => { s.uid = e.target.value; if (s.uid !== '__guest') s.name = ''; saveDraft(); renderNew(); };
-    $('.identity', el).onchange = (e) => {
-      el.classList.remove('identity-' + s.identity);
-      s.identity = e.target.value;
-      el.classList.add('identity-' + s.identity);
-      refreshHint();
+  wrap.addEventListener('click', (e) => { if (e.target === wrap) close(); });
+  $('[data-close]', wrap).onclick = close;
+  $('#sheet-clear', wrap)?.addEventListener('click', () => choose(''));
+  $('#sheet-q', wrap).addEventListener('input', (e) => { q = e.target.value; draw(); });
+  $$('.chip', wrap).forEach((b) => {
+    b.onclick = () => {
+      f = b.dataset.f;
+      $$('.chip', wrap).forEach((x) => { x.classList.toggle('on', x === b); x.setAttribute('aria-pressed', x === b); });
+      draw();
     };
-    $('.gname', el)?.addEventListener('input', (e) => { s.name = e.target.value; refreshHint(); });
-    $('.hero', el).addEventListener('input', (e) => {
-      s.hero = e.target.value;
-      const h = heroByName(s.hero);
-      $('.hero-hint', el).textContent = h ? `${h.faction}・${h.tagline}` : '';
-      saveDraft();
+  });
+  document.addEventListener('keydown', onKey);
+  draw();
+  sheet.focus();
+}
+
+/* 第 3 步：亮身份 + 誰贏了 */
+function idCountHtml(d) {
+  return identityCheck(d).map((c) => `<span class="idc id-${c.id} ${c.have > c.need ? 'bad' : c.have === c.need ? 'ok' : ''}"><i>${ID_SHORT[c.id]}</i>${c.have}/${c.need}</span>`).join('');
+}
+function newStep3(d) {
+  const unset = d.seats.filter((s) => !s.identity).length;
+  const ready = !unset && d.winner;
+  const preview = d.seats.map((s) => ({ name: seatName(s), hero: heroByName(s.hero)?.name || s.hero.trim(), identity: s.identity, win: d.winner ? isWin(s.identity, d.winner) : false }));
+  const saveLabel = unset ? `還有 ${unset} 人沒亮身份` : !d.winner ? '選哪一方獲勝' : '儲存這局';
+  return `
+    <div class="card">
+      <div class="label-row"><span class="label">亮身份</span><span class="muted">${d.count - unset}/${d.count} 已亮</span></div>
+      <div class="id-count" aria-label="身份人數">${idCountHtml(d)}</div>
+      <div class="reveal-list">${d.seats.map((s, i) => {
+        const hero = heroByName(s.hero)?.name || s.hero.trim();
+        return `<div class="reveal-row" data-i="${i}">
+          <span class="no">${SEAT_CN[i]}</span>
+          <span class="who"><b>${esc(seatName(s))}</b>${hero ? `<small>${esc(hero)}</small>` : ''}</span>
+          <div class="idpick" role="group" aria-label="${SEAT_CN[i]}號位 ${esc(seatName(s))} 的身份">${IDENTITIES.map((id) => `<button class="idbtn id-${id} ${s.identity === id ? 'on' : ''}" data-id="${id}" aria-pressed="${s.identity === id}" aria-label="${id}">${ID_SHORT[id]}</button>`).join('')}</div>
+        </div>`;
+      }).join('')}</div>
+    </div>
+    <div class="sec">哪一方獲勝？</div>
+    <div class="winners">${SIDES.map((w) => {
+      const who = sideMembers(d, w);
+      return `<button class="win-btn side-${w} ${d.winner === w ? 'on' : ''}" data-w="${w}" aria-pressed="${d.winner === w}">
+        <span class="wb-title">${w}</span>
+        <span class="wb-goal">${SIDE_GOAL[w]}</span>
+        <span class="wb-who">${who.length ? esc(who.join('、')) : unset ? '（身份亮完會列出成員）' : '（這局沒有人）'}</span>
+      </button>`;
+    }).join('')}</div>
+    ${ready ? `<div class="sec">本局結果</div><div class="card">${resultList(preview)}</div>` : ''}
+    <div style="height:12px"></div>
+    <textarea id="note" rows="2" aria-label="備註" placeholder="備註（可不填），例如：內奸單挑主公翻盤">${esc(d.note || '')}</textarea>
+    ${actionBar('‹ 上一步', saveLabel, !ready)}`;
+}
+function bindStep3(d) {
+  $$('.reveal-row').forEach((row) => {
+    const s = d.seats[+row.dataset.i];
+    $$('.idbtn', row).forEach((b) => {
+      b.onclick = () => {
+        s.identity = s.identity === b.dataset.id ? '' : b.dataset.id; // 再點一次可取消
+        saveDraft();
+        rerenderKeepScroll();
+      };
     });
   });
-
-  $$('input[name=winner]').forEach((r) => {
-    r.onchange = () => {
-      d.winner = r.value;
-      $$('.radio-group label').forEach((l) => l.classList.toggle('on', l.contains(r)));
-      refreshHint();
-    };
+  $$('.win-btn').forEach((b) => {
+    b.onclick = () => { d.winner = d.winner === b.dataset.w ? '' : b.dataset.w; saveDraft(); rerenderKeepScroll(); };
   });
   $('#note').addEventListener('input', (e) => { d.note = e.target.value; saveDraft(); });
-  $('#save').onclick = saveGame;
+  $('#prev').onclick = () => setStep(2);
+  $('#next').onclick = saveGame;
 }
 
 async function saveGame() {
   const d = state.draft;
   const errs = [];
-  if (d.seats.filter((s) => s.identity === '主公').length !== 1) errs.push('主公要剛好 1 位');
-  if (!d.winner) errs.push('請選誰贏了');
-  if (d.winner && !d.seats.some((s) => isWin(s.identity, d.winner))) errs.push('沒有人屬於獲勝陣營');
+  const unset = d.seats.filter((s) => !s.identity).length;
+  if (unset) errs.push(`還有 ${unset} 人沒亮身份`);
+  else if (d.seats.filter((s) => s.identity === '主公').length !== 1) errs.push('主公要剛好 1 位，檢查一下身份');
+  if (!d.winner) errs.push('請選哪一方獲勝');
+  if (!unset && d.winner && !d.seats.some((s) => isWin(s.identity, d.winner))) errs.push(`這局沒有人是${d.winner}，檢查一下身份`);
 
   const seats = d.seats.map((s, i) => {
     const isGuest = s.uid === '__guest';
-    const name = isGuest ? s.name.trim() : userName(s.uid) || '';
-    if (!name) errs.push(`${i + 1} 號位還沒選玩家`);
+    const name = seatName(s);
+    if (!name) errs.push(`${SEAT_CN[i]}號位還沒有玩家`);
     const h = heroByName(s.hero);
     return {
       seat: i + 1,
@@ -557,6 +912,8 @@ async function saveGame() {
   const uids = seats.map((s) => s.uid).filter(Boolean);
   if (new Set(uids).size !== uids.length) errs.push('同一個玩家被選了兩次');
   if (errs.length) { toast(errs[0]); return; }
+  if (identityCheck(d).some((c) => c.have !== c.need)
+    && !confirm(`身份人數跟 ${d.count} 人局的標準配置不一樣（${countText(d.count).split('：')[1]}），確定要這樣存嗎？`)) return;
 
   const game = {
     createdAt: Date.now(),
@@ -568,26 +925,69 @@ async function saveGame() {
     seats,
     playerUids: uids,
   };
-  const btn = $('#save');
+  const btn = $('#next');
   btn.disabled = true;
   btn.textContent = '儲存中…';
   try {
-    await store.addGame(game);
-    // 保留同一批玩家，方便「再來一局」
+    const id = await store.addGame(game);
+    rememberGuests(seats.filter((s) => !s.uid).map((s) => s.name));
+    // 先把下一局準備好：同一批人、直接到選武將
     const next = newDraft(d.count);
+    next.step = 2;
     next.seats.forEach((s, i) => { s.uid = d.seats[i].uid; s.name = d.seats[i].name; });
+    state.lastDraft = structuredClone(d); // 撤銷時可以還原
     state.draft = next;
     saveDraft();
+    state.justSaved = { ...game, id };
     state.games = null;
-    toast('已儲存！同一批人可以直接再來一局');
     window.scrollTo(0, 0);
     renderNew();
   } catch (e) {
     console.error(e);
-    toast('儲存失敗：' + (e.code || e.message));
+    toast('儲存失敗：' + errText(e) + '。資料還在，可以再按一次');
     btn.disabled = false;
     btn.textContent = '儲存這局';
   }
+}
+
+function renderSaved() {
+  const g = state.justSaved;
+  view.innerHTML = `
+    ${pageHead('開局')}
+    <div class="card">
+      <div class="saved-head">
+        <span class="stamp big" aria-hidden="true">錄</span>
+        <div><div class="saved-title">本局已記錄</div><div class="muted">${g.playerCount} 人局・${esc(g.winner)}獲勝</div></div>
+      </div>
+      ${resultList(g.seats)}
+      ${g.note ? `<div class="game-note">「${esc(g.note)}」</div>` : ''}
+    </div>
+    <div class="actions">
+      <button class="btn" id="again">同一批人再來一局</button>
+      <button class="btn secondary" id="fresh">換一批人開新局</button>
+      ${g.id && state.lastDraft ? '<button class="link-btn center" id="undo-save">記錯了？撤銷這局，回去修改</button>' : ''}
+    </div>`;
+  $('#again').onclick = () => { state.justSaved = null; renderNew(); };
+  $('#fresh').onclick = () => {
+    state.justSaved = null;
+    state.draft = newDraft(state.draft.count);
+    saveDraft();
+    renderNew();
+  };
+  $('#undo-save')?.addEventListener('click', async (ev) => {
+    const btn = ev.currentTarget;
+    btn.disabled = true;
+    try {
+      await store.deleteGame(g.id);
+      state.draft = state.lastDraft;
+      state.lastDraft = null;
+      saveDraft();
+      state.justSaved = null;
+      state.games = null;
+      toast('已撤銷，可以修改後再存一次');
+      renderNew();
+    } catch (e) { console.error(e); toast('撤銷失敗：' + errText(e)); btn.disabled = false; }
+  });
 }
 
 /* ---------- 統計 ---------- */
@@ -614,14 +1014,26 @@ function aggregate(games) {
   return { players: [...players.values()], heroes: [...heroes.values()], sides };
 }
 
+// 勝率條列：武將或玩家
+function heroRow(h, i, rankNo) {
+  const hero = heroByName(h.name);
+  const lead = rankNo ? `<span class="rank-no">${i + 1}</span>` : seal(hero?.faction || '？', 'sm');
+  const inner = `${lead}
+    <div class="main"><b>${esc(h.name)}</b><div class="bar"><i style="width:${pctNum(h.wins, h.games)}%;background:var(--fc,var(--gold-text))"></i></div></div>
+    <div class="bar-val">${pct(h.wins, h.games)}<small>${h.wins} 勝／${h.games} 場</small></div>`;
+  return hero
+    ? `<a class="list-row link f-${esc(hero.faction)}" href="#heroes/${encodeURIComponent(hero.id)}">${inner}</a>`
+    : `<div class="list-row">${inner}</div>`;
+}
+
 /* ---------- 頁面：我的 ---------- */
 async function renderMe() {
   if (!store.user) {
-    view.innerHTML = '<h2>我的戰績</h2>' + loginBox('登入後可以看自己的勝率、各身份表現、最常用武將。');
+    view.innerHTML = pageHead('我的戰績') + loginBox('登入後可以看自己的勝率、各身份表現、最常用武將。');
     bindLogin();
     return;
   }
-  if (!state.games) view.innerHTML = '<div class="empty">載入中…</div>';
+  if (!state.games) view.innerHTML = '<div class="empty">正在讀取你的戰績…</div>';
   await ensureData();
   const me = store.user.uid;
   const my = state.games.map((g) => ({ g, s: g.seats.find((s) => s.uid === me) })).filter((x) => x.s);
@@ -636,26 +1048,23 @@ async function renderMe() {
   const heroMap = new Map();
   for (const { s } of my) {
     if (!s.hero) continue;
-    const h = heroMap.get(s.hero) || { name: s.hero, n: 0, w: 0 };
-    h.n++;
-    if (s.win) h.w++;
+    const h = heroMap.get(s.hero) || { name: s.hero, games: 0, wins: 0 };
+    h.games++;
+    if (s.win) h.wins++;
     heroMap.set(s.hero, h);
   }
-  const topHeroes = [...heroMap.values()].sort((a, b) => b.n - a.n || b.w - a.w).slice(0, 5);
+  const topHeroes = [...heroMap.values()].sort((a, b) => b.games - a.games || b.wins - a.wins).slice(0, 5);
 
   view.innerHTML = `
+    ${pageHead('我的戰績')}
     <div class="card">
       <div class="profile">
-        ${store.user.photo ? `<img src="${esc(store.user.photo)}" alt="" referrerpolicy="no-referrer">` : ''}
-        <div style="flex:1">
-          <div class="hero-name">${esc(store.user.name)}</div>
+        ${avatarHtml(store.user)}
+        <div class="who">
+          <div class="name">${esc(store.user.name)}</div>
           <div class="muted">${store.mode === 'local' ? '本機帳號' : 'Google 帳號'}</div>
         </div>
-      </div>
-      <div class="row"><input id="rename" placeholder="改暱稱（別人在開局清單看到的名字）" value="${esc(store.user.name)}"><button class="btn secondary small" id="rename-btn" style="flex:0 0 auto">改名</button></div>
-      <div style="display:flex;gap:8px">
-        <button class="btn secondary small" id="logout">登出</button>
-        ${store.user.isAdmin ? '<button class="btn secondary small" id="to-admin">🛠 管理頁</button>' : ''}
+        ${store.user.isAdmin ? '<button class="btn secondary small" id="to-admin" style="flex:0 0 auto">管理頁</button>' : ''}
       </div>
     </div>
 
@@ -665,22 +1074,28 @@ async function renderMe() {
       <div class="stat"><div class="v">${streak}</div><div class="l">目前連勝</div></div>
     </div>
 
-    <h3>各身份表現</h3>
-    <div class="card"><table>
-      <tr><th>身份</th><th class="num">場</th><th class="num">勝</th><th class="num">勝率</th></tr>
-      ${byId.map((r) => `<tr><td>${r.id}</td><td class="num">${r.n}</td><td class="num">${r.w}</td><td class="num">${pct(r.w, r.n)}</td></tr>`).join('')}
-    </table></div>
+    <div class="sec">各身份表現</div>
+    <div class="card">${byId.map((r) => `<div class="bar-row id-${r.id}">
+        <span class="idtag">${r.id}</span>
+        <div class="bar"><i style="width:${pctNum(r.w, r.n)}%"></i></div>
+        <span class="bar-val">${pct(r.w, r.n)}<small>${r.w} 勝／${r.n} 場</small></span>
+      </div>`).join('')}</div>
 
-    <h3>最常用武將</h3>
-    ${topHeroes.length
-      ? `<div class="card"><table>
-          <tr><th>武將</th><th class="num">場</th><th class="num">勝率</th></tr>
-          ${topHeroes.map((h) => `<tr><td>${esc(h.name)}</td><td class="num">${h.n}</td><td class="num">${pct(h.w, h.n)}</td></tr>`).join('')}
-        </table></div>`
-      : '<p class="muted">還沒有紀錄</p>'}
+    <div class="sec">最常用武將</div>
+    ${topHeroes.length ? `<div class="card">${topHeroes.map((h, i) => heroRow(h, i, false)).join('')}</div>` : '<div class="empty">記錄時有填武將，這裡就會出現你最常用的幾位</div>'}
 
-    <h3>最近對局</h3>
-    ${my.length ? my.slice(0, 20).map((x) => gameCard(x.g, me)).join('') : '<div class="empty">還沒打過，去「開局」記一場吧！</div>'}
+    <div class="sec">最近對局${my.length > 20 ? '<span class="muted">顯示最近 20 場</span>' : ''}</div>
+    ${my.length ? my.slice(0, 20).map((x) => gameCard(x.g, me)).join('') : '<div class="empty">你還沒有入座過任何一局。<br><a class="link-btn" href="#new">去開局記一場</a></div>'}
+
+    <div class="sec">帳號</div>
+    <details class="card settings">
+      <summary>改暱稱、登出</summary>
+      <div class="inner">
+        <label class="field" for="rename"><span>暱稱（別人在開局玩家清單看到的名字）</span></label>
+        <div class="row"><input id="rename" maxlength="20" value="${esc(store.user.name)}"><button class="btn secondary small" id="rename-btn" style="flex:0 0 auto">改名</button></div>
+        <button class="btn danger" id="logout">登出</button>
+      </div>
+    </details>
   `;
   $('#logout').onclick = async () => { await store.signOut(); };
   $('#to-admin')?.addEventListener('click', () => { go('admin'); window.scrollTo(0, 0); });
@@ -693,19 +1108,26 @@ async function renderMe() {
       renderUser();
       toast('已改名');
       renderMe();
-    } catch (e) { console.error(e); toast('改名失敗'); }
+    } catch (e) { console.error(e); toast('改名失敗：' + errText(e)); }
   };
   bindDelete();
 }
 
 /* ---------- 頁面：排行 ---------- */
+// 勝率相同就同名次（例如兩個 0% 都是第 4 名）
+function rankOf(list, i) {
+  const rate = (p) => p.wins / p.games;
+  let r = i;
+  while (r > 0 && rate(list[r - 1]) === rate(list[i])) r--;
+  return r + 1;
+}
 async function renderRank() {
   if (store.mode === 'firebase' && !store.user) {
-    view.innerHTML = '<h2>排行榜</h2>' + loginBox('登入後才能看大家的戰績。');
+    view.innerHTML = pageHead('排行榜') + loginBox('登入後才能看大家的戰績。');
     bindLogin();
     return;
   }
-  if (!state.games) view.innerHTML = '<div class="empty">載入中…</div>';
+  if (!state.games) view.innerHTML = '<div class="empty">正在讀取大家的戰績…</div>';
   await ensureData();
   const total = state.games.length;
   const { players, heroes, sides } = aggregate(state.games);
@@ -714,36 +1136,44 @@ async function renderRank() {
     .sort((a, b) => b.wins / b.games - a.wins / a.games || b.games - a.games);
   const hs = heroes.sort((a, b) => b.games - a.games || b.wins - a.wins).slice(0, 15);
 
-  view.innerHTML = `
-    <h2>排行榜</h2>
-    <div class="stats">
-      ${SIDES.map((s) => `<div class="stat"><div class="v">${pct(sides[s] || 0, total)}</div><div class="l">${s}勝（${sides[s] || 0}場）</div></div>`).join('')}
-    </div>
-    <p class="muted">共 ${total} 局</p>
-
-    <h3>玩家勝率</h3>
-    <div class="row"><span style="flex:0 0 auto" class="muted">至少</span>
-      <select id="min">${[1, 3, 5, 10].map((n) => `<option value="${n}" ${n === state.minGames ? 'selected' : ''}>${n} 場</option>`).join('')}</select>
+  const playerList = `
+    <div class="min-row"><span class="muted" id="min-label">至少打過</span>
+      <div class="chips" id="min" role="group" aria-labelledby="min-label">${[1, 3, 5, 10].map((n) => `<button class="chip ${n === state.minGames ? 'on' : ''}" data-n="${n}" aria-pressed="${n === state.minGames}">${n} 場</button>`).join('')}</div>
     </div>
     ${ps.length
-      ? `<div class="card"><table>
-          <tr><th>#</th><th>玩家</th><th class="num">場</th><th class="num">勝</th><th class="num">勝率</th></tr>
-          ${ps.map((p, i) => `<tr><td>${i + 1}</td><td>${esc(p.name)}${p.uid ? '' : ' <span class="muted">訪客</span>'}</td><td class="num">${p.games}</td><td class="num">${p.wins}</td><td class="num">${pct(p.wins, p.games)}</td></tr>`).join('')}
-        </table></div>`
-      : '<div class="empty">還沒有資料</div>'}
+      ? `<div class="card">${ps.map((p, i) => {
+          const rank = rankOf(ps, i);
+          const isMe = store.user && p.uid === store.user.uid;
+          return `<div class="list-row ${isMe ? 'me' : ''}">
+          <span class="rank-no ${rank <= 3 ? 'r' + rank : ''}">${rank}</span>
+          <div class="main"><b>${esc(p.name)}${isMe ? '（我）' : ''}${p.uid ? '' : ' <span class="muted" style="font-weight:400">訪客</span>'}</b><div class="bar"><i style="width:${pctNum(p.wins, p.games)}%"></i></div></div>
+          <div class="bar-val">${pct(p.wins, p.games)}<small>${p.wins} 勝／${p.games} 場</small></div>
+        </div>`;
+        }).join('')}</div>`
+      : `<div class="empty">${state.minGames > 1 ? `還沒有人打滿 ${state.minGames} 場，把門檻調低看看` : '還沒有對局紀錄'}</div>`}`;
+  const heroList = hs.length
+    ? `<p class="muted">依出場次數排序，前 15 名</p><div class="card">${hs.map((h, i) => heroRow(h, i, true)).join('')}</div>`
+    : '<div class="empty">記錄時有填武將，這裡就會列出大家最常用的武將</div>';
 
-    <h3>熱門武將</h3>
-    ${hs.length
-      ? `<div class="card"><table>
-          <tr><th>武將</th><th class="num">出場</th><th class="num">勝率</th></tr>
-          ${hs.map((h) => `<tr><td>${esc(h.name)}</td><td class="num">${h.games}</td><td class="num">${pct(h.wins, h.games)}</td></tr>`).join('')}
-        </table></div>`
-      : '<div class="empty">還沒有資料</div>'}
+  view.innerHTML = `
+    ${pageHead('排行榜')}
+    <div class="card">
+      <div class="label-row"><span class="label">各陣營勝率</span><span class="muted">共 ${total} 局</span></div>
+      <div class="stack">${SIDES.map((s) => `<i class="side-${s}" style="width:${pctNum(sides[s] || 0, total)}%"></i>`).join('')}</div>
+      <div class="legend">${SIDES.map((s) => `<div class="side-${s}"><b>${pct(sides[s] || 0, total)}</b><span>${s}（${sides[s] || 0}）</span></div>`).join('')}</div>
+    </div>
 
-    <h3>最近對局</h3>
-    ${state.games.slice(0, 10).map((g) => gameCard(g, store.user?.uid)).join('') || '<div class="empty">還沒有資料</div>'}
+    <div class="seg" id="rank-tabs" role="group" aria-label="排行類別" style="margin:16px 0 12px">
+      <button data-t="players" class="${state.rankTab === 'players' ? 'on' : ''}" aria-pressed="${state.rankTab === 'players'}">玩家勝率</button>
+      <button data-t="heroes" class="${state.rankTab === 'heroes' ? 'on' : ''}" aria-pressed="${state.rankTab === 'heroes'}">熱門武將</button>
+    </div>
+    ${state.rankTab === 'players' ? playerList : heroList}
+
+    <div class="sec">最近對局</div>
+    ${state.games.slice(0, 10).map((g) => gameCard(g, store.user?.uid)).join('') || '<div class="empty">還沒有對局紀錄。<br><a class="link-btn" href="#new">去開局記第一場</a></div>'}
   `;
-  $('#min').onchange = (e) => { state.minGames = +e.target.value; renderRank(); };
+  $$('#rank-tabs button').forEach((b) => { b.onclick = () => { state.rankTab = b.dataset.t; renderRank(); }; });
+  $$('#min button').forEach((b) => { b.onclick = () => { state.minGames = +b.dataset.n; renderRank(); }; });
   bindDelete();
 }
 
@@ -753,7 +1183,7 @@ const field = (label, html) => `<label class="field"><span>${label}</span>${html
 const errorBox = (errs) => (errs.length
   ? `<div class="errors">${errs.slice(0, 20).map((e) => `<div>⚠️ ${esc(e)}</div>`).join('')}${errs.length > 20 ? `<div>…還有 ${errs.length - 20} 個問題</div>` : ''}</div>`
   : '');
-const saveErrorText = (e) => (e.code === 'permission-denied' ? '沒有權限（管理權限可能被移除了，請重新整理）' : e.code || e.message);
+const saveErrorText = (e) => (e.code === 'permission-denied' ? '沒有權限（管理權限可能被移除了，請重新整理）' : errText(e));
 
 async function saveHeroList(list) {
   const bytes = new TextEncoder().encode(JSON.stringify(list)).length;
@@ -765,12 +1195,12 @@ async function saveHeroList(list) {
 
 async function renderAdmin() {
   if (!store.user) {
-    view.innerHTML = '<h2>管理頁</h2>' + loginBox('管理頁需要先登入。');
+    view.innerHTML = pageHead('管理頁') + loginBox('管理頁需要先登入。');
     bindLogin();
     return;
   }
   if (!store.user.isAdmin) {
-    view.innerHTML = `<h2>管理頁</h2><div class="card">
+    view.innerHTML = `${pageHead('管理頁')}<div class="card">
       <p>你沒有管理權限。</p>
       <p class="muted">需要的話，請把你的登入信箱給管理員，請他在管理頁把你加進名單，加好後重新整理這頁。</p>
       ${store.user.email ? `<p class="muted">你的登入信箱：${esc(store.user.email)}</p>` : ''}
@@ -779,9 +1209,10 @@ async function renderAdmin() {
   }
   const a = state.admin;
   view.innerHTML = `
-    <h2>管理頁</h2>
-    <div class="chips">${Object.entries(ADMIN_TABS).map(([k, v]) => `<button class="chip atab ${k === a.tab ? 'on' : ''}" data-t="${k}">${v}</button>`).join('')}</div>
-    ${store.mode === 'local' ? '<p class="muted">本機模式：改動只存在這個瀏覽器，登入就有管理權限。</p>' : ''}
+    <a class="back" href="#me">‹ 我的</a>
+    ${pageHead('管理頁')}
+    <div class="seg">${Object.entries(ADMIN_TABS).map(([k, v]) => `<button class="atab ${k === a.tab ? 'on' : ''}" data-t="${k}">${v}</button>`).join('')}</div>
+    ${store.mode === 'local' ? '<p class="muted" style="margin-top:8px">本機模式：改動只存在這個瀏覽器，登入就有管理權限。</p>' : ''}
     <div id="admin-box" style="margin-top:12px"></div>`;
   $$('.atab').forEach((b) => {
     b.onclick = () => { a.tab = b.dataset.t; a.editing = null; renderAdmin(); };
@@ -803,7 +1234,7 @@ function renderAdminHeroes() {
       <button class="btn small" id="hero-add">＋ 新增武將</button>
       <button class="btn secondary small" id="hero-dl">⬇ 下載 JSON</button>
     </div>
-    <input id="admin-q" type="search" placeholder="搜尋要改的武將" value="${esc(a.q)}" autocomplete="off">
+    <input id="admin-q" type="search" aria-label="搜尋要改的武將" placeholder="搜尋要改的武將" value="${esc(a.q)}" autocomplete="off">
     <div id="admin-hero-list" style="margin-top:8px"></div>`;
 
   const drawList = () => {
@@ -811,7 +1242,7 @@ function renderAdminHeroes() {
     const el = $('#admin-hero-list');
     el.innerHTML = list.length
       ? list.map((h) => `<div class="card admin-row">
-          <div class="faction ${esc(h.faction)}">${esc(h.faction)}</div>
+          ${seal(h.faction)}
           <div style="flex:1;min-width:0">
             <div class="ellipsis"><b>${esc(h.name)}</b> <span class="hero-sub">${esc(h.version)}・${esc(h.id)}</span></div>
             <div class="muted ellipsis">${esc(h.tagline)}</div>
@@ -857,7 +1288,7 @@ function renderHeroForm(box) {
   const h = a.editing;
   box.innerHTML = `
     <div class="card">
-      <h3 style="margin-top:0">${a.isNew ? '新增武將' : '編輯：' + esc(h.name)}</h3>
+      <h3 style="margin-top:0;font-family:var(--serif)">${a.isNew ? '新增武將' : '編輯：' + esc(h.name)}</h3>
       ${field('id（英文代號，不能重複）', `<input id="f-id" value="${esc(h.id)}" ${a.isNew ? '' : 'disabled'} placeholder="例如 jie_guanyu" autocapitalize="off" autocomplete="off">`)}
       ${field('名字', `<input id="f-name" value="${esc(h.name)}" placeholder="例如 界關羽">`)}
       <div class="row">
@@ -869,11 +1300,11 @@ function renderHeroForm(box) {
         ${field('血量', `<input id="f-hp" type="number" inputmode="numeric" min="1" max="10" value="${Number.isFinite(h.hp) ? h.hp : ''}">`)}
         ${field('難度', `<select id="f-diff">${[1, 2, 3].map((n) => `<option value="${n}" ${n === h.difficulty ? 'selected' : ''}>${DIFF[n]}</option>`).join('')}</select>`)}
       </div>
-      ${field('一句話定位', `<input id="f-tagline" value="${esc(h.tagline)}">`)}
+      ${field('一句話定位', `<textarea id="f-tagline" rows="2">${esc(h.tagline)}</textarea>`)}
       ${field('別名（用頓號或逗號分隔）', `<input id="f-aliases" value="${esc(h.aliases.join('、'))}" placeholder="簡體字、俗稱、常見錯字">`)}
       ${field('標籤（用頓號或逗號分隔）', `<input id="f-roles" value="${esc(h.roles.join('、'))}" placeholder="輸出、新手推薦">`)}
     </div>
-    <h3>技能</h3>
+    <div class="sec">技能</div>
     ${h.skills.map((s, i) => `<div class="card skill-edit" data-i="${i}">
         <div class="row">
           <input class="s-name" value="${esc(s.name)}" placeholder="技能名">
@@ -968,9 +1399,9 @@ function renderAdminUpload() {
       <input type="file" id="up-file" accept=".json,application/json">
       <div style="height:8px"></div>
       <textarea id="up-text" rows="8" placeholder='{"heroes": [ … ]}' spellcheck="false" autocapitalize="off">${esc(u.text)}</textarea>
-      <h3>匯入方式</h3>
-      <div class="radio-group">
-        ${[['merge', '合併'], ['replace', '整份取代']].map(([v, l]) => `<label class="${u.mode === v ? 'on' : ''}"><input type="radio" name="up-mode" value="${v}" ${u.mode === v ? 'checked' : ''}>${l}</label>`).join('')}
+      <div class="label" style="margin-top:12px">匯入方式</div>
+      <div class="seg" id="up-mode">
+        ${[['merge', '合併'], ['replace', '整份取代']].map(([v, l]) => `<button data-v="${v}" class="${u.mode === v ? 'on' : ''}">${l}</button>`).join('')}
       </div>
       <p class="muted">${u.mode === 'merge'
         ? '合併：同 id 的武將會被檔案內容覆蓋，新的會加進來，其他的保留不動。'
@@ -988,7 +1419,7 @@ function renderAdminUpload() {
     $('#up-text').value = u.text;
     clearResult();
   };
-  $$('input[name=up-mode]').forEach((r) => { r.onchange = () => { u.mode = r.value; renderAdminUpload(); }; });
+  $$('#up-mode button').forEach((r) => { r.onclick = () => { u.mode = r.dataset.v; renderAdminUpload(); }; });
 
   $('#up-check').onclick = () => {
     const out = $('#up-result');
@@ -1063,7 +1494,7 @@ function renderAdminUpload() {
 /* 管理頁：管理員名單 */
 async function renderAdminAdmins() {
   const box = $('#admin-box');
-  box.innerHTML = '<div class="empty">載入中…</div>';
+  box.innerHTML = '<div class="empty">正在讀取管理員名單…</div>';
   let admins;
   try {
     admins = (await store.listAdmins()).sort((x, y) => (x.addedAt || 0) - (y.addedAt || 0));
@@ -1077,7 +1508,7 @@ async function renderAdminAdmins() {
     <div class="card">
       <p class="muted" style="margin-top:0">名單上的 Google 信箱登入後就有管理權限，會在「我的」看到「管理頁」按鈕。</p>
       <div class="row" style="margin-bottom:0">
-        <input id="ad-email" type="email" inputmode="email" autocapitalize="off" autocomplete="off" placeholder="對方的 Gmail，例如 friend@gmail.com">
+        <input id="ad-email" type="email" inputmode="email" autocapitalize="off" autocomplete="off" aria-label="要加入的管理員信箱" placeholder="對方的 Gmail，例如 friend@gmail.com">
         <button class="btn small" id="ad-add" style="flex:0 0 auto">新增</button>
       </div>
     </div>
@@ -1123,21 +1554,49 @@ async function renderAdminAdmins() {
 
 /* ---------- 路由 ---------- */
 // admin 不在底部分頁列，只能從網址 #admin 或「我的」的管理頁按鈕進入
+// 武將詳情頁用 #heroes/<id>，可以用瀏覽器的返回鍵回列表
 const PAGES = { heroes: renderHeroes, new: renderNew, me: renderMe, rank: renderRank, admin: renderAdmin };
 
+function parseHash() {
+  const [t, arg] = location.hash.slice(1).split('/');
+  const tab = PAGES[t] ? t : 'heroes';
+  let heroId = null;
+  if (tab === 'heroes' && arg) { try { heroId = decodeURIComponent(arg); } catch { heroId = null; } }
+  return { tab, heroId };
+}
 function go(tab) {
   if (!PAGES[tab]) tab = 'heroes';
   if (location.hash !== '#' + tab) history.replaceState(null, '', '#' + tab);
+  if (tab !== 'new') state.justSaved = null;
   state.tab = tab;
+  state.heroId = null;
+  state.cameFromList = false;
   render();
 }
+async function onHashChange() {
+  const { tab, heroId } = parseHash();
+  if (tab === state.tab && heroId === state.heroId) return;
+  const wasList = state.tab === 'heroes' && !state.heroId;
+  const backToList = tab === 'heroes' && !heroId && !!state.heroId;
+  state.cameFromList = !!heroId && wasList;
+  if (tab !== 'new') state.justSaved = null;
+  state.tab = tab;
+  state.heroId = heroId;
+  await render();
+  window.scrollTo(0, backToList ? state.heroScroll : 0);
+}
 async function render() {
-  $$('.tabbar button').forEach((b) => b.classList.toggle('active', b.dataset.tab === state.tab));
+  $$('.tabbar button').forEach((b) => {
+    const on = b.dataset.tab === state.tab;
+    b.classList.toggle('active', on);
+    if (on) b.setAttribute('aria-current', 'page'); else b.removeAttribute('aria-current');
+  });
   try {
     await PAGES[state.tab]();
   } catch (e) {
     console.error(e);
-    view.innerHTML = `<div class="card"><p>載入失敗：${esc(e.code || e.message)}</p><p class="muted">如果是 permission-denied，請確認 Firestore 規則已貼上、而且已登入。</p></div>`;
+    view.innerHTML = `<div class="card"><p><b>載入失敗</b>：${esc(errText(e))}</p><p class="muted">已經記下的資料不會不見。</p><button class="btn" id="retry">重新載入</button></div>`;
+    $('#retry').onclick = () => { state.games = null; render(); };
   }
 }
 
@@ -1175,12 +1634,10 @@ async function main() {
   await loadHeroes();
 
   $$('.tabbar button').forEach((b) => { b.onclick = () => { go(b.dataset.tab); window.scrollTo(0, 0); }; });
-  state.tab = PAGES[location.hash.slice(1)] ? location.hash.slice(1) : 'heroes';
-  // 手動改網址的 #（例如打 #admin）也能切頁
-  window.addEventListener('hashchange', () => {
-    const t = location.hash.slice(1);
-    if (PAGES[t] && t !== state.tab) { state.tab = t; render(); }
-  });
+  Object.assign(state, parseHash());
+  // 捲動位置自己管（武將列表 ↔ 詳情頁），不讓瀏覽器自動還原
+  if ('scrollRestoration' in history) history.scrollRestoration = 'manual';
+  window.addEventListener('hashchange', onHashChange);
 
   let started = false;
   await store.init(() => {
