@@ -309,6 +309,9 @@ const state = {
   q: '',
   faction: '全部',
   easyOnly: false,
+  // 比較：只放在記憶體，不寫進網址或 localStorage，重新整理就清掉（選將是暗的）
+  cmpPicks: {}, // 一個名字符合好幾位時，使用者點選的那位：{ 名字: heroId }
+  cmpSel: 0,
   users: [],
   games: null,
   minGames: 1,
@@ -443,6 +446,32 @@ function heroMatch(h, q) {
   q = q.toLowerCase();
   return [h.name, h.title, h.version, ...(h.aliases || []), ...(h.skills || []).map((s) => s.name)].some((s) => s && s.toLowerCase().includes(q));
 }
+// 一次打好幾個名字（空格、逗號、頓號隔開）就是比較模式
+const CMP_MAX = 5;
+const splitTerms = (q) => str(q).split(/[\s,，、/／;；]+/).filter(Boolean);
+const isCompareQuery = () => splitTerms(state.q).length >= 2;
+function compareSet() {
+  const terms = [...new Set(splitTerms(state.q))];
+  const found = [];
+  const ambiguous = [];
+  const missing = [];
+  for (const t of terms) {
+    const lt = t.toLowerCase();
+    // 名字或別名完全相同的優先（「關羽」不會連界關羽、謀關羽一起抓）
+    const exact = state.heroes.filter((h) => h.name.toLowerCase() === lt || h.aliases.some((a) => a.toLowerCase() === lt));
+    const cands = exact.length ? exact : state.heroes.filter((h) => heroMatch(h, t));
+    if (!cands.length) { missing.push(t); continue; }
+    const pick = cands.length === 1 ? cands[0] : cands.find((h) => h.id === state.cmpPicks[t]);
+    if (cands.length > 1) ambiguous.push({ term: t, cands, pick });
+    if (pick && !found.includes(pick)) found.push(pick);
+  }
+  return { heroes: found.slice(0, CMP_MAX), over: found.length > CMP_MAX, ambiguous, missing };
+}
+function clearCompare() {
+  state.q = '';
+  state.cmpPicks = {};
+  state.cmpSel = 0;
+}
 function filteredHeroes() {
   const q = state.q.trim();
   return state.heroes.filter((h) => (state.faction === '全部' || h.faction === state.faction)
@@ -458,6 +487,11 @@ function heroTile(h) {
   </a>`;
 }
 function renderHeroList() {
+  const multi = isCompareQuery();
+  $('.filters').classList.toggle('cmp-mode', multi);
+  if (multi) { renderCompareList(); return; }
+  $('#cmp-note').innerHTML = '';
+  $('#cmp-bar').innerHTML = '';
   const list = filteredHeroes();
   const box = $('#hero-list-box');
   const q = state.q.trim();
@@ -471,7 +505,7 @@ function renderHeroList() {
       : `找不到「${esc(q)}」。試試別名、簡體字，或少打幾個字`}</div>`;
   $('#hero-count').innerHTML = filtered
     ? `顯示 ${list.length}／${state.heroes.length} 位（${esc(filterName)}）<button class="link-btn clear-filter">清除篩選</button>`
-    : `${list.length} 位`;
+    : `${list.length} 位${q ? '' : '<span class="cmp-hint">拿到幾位要選一位？一次打幾個名字，用空格隔開就能比較</span>'}`;
   $$('.clear-filter').forEach((b) => {
     b.onclick = () => {
       state.faction = '全部';
@@ -485,24 +519,66 @@ function renderHeroList() {
   // 記下捲動位置，從詳情頁回來時回到原處
   $$('.hcard', box).forEach((a) => { a.addEventListener('click', () => { state.heroScroll = window.scrollY; }); });
 }
+// 比較模式的列表：每個名字對到一位武將，下面固定「比較這 N 位」
+function renderCompareList() {
+  const c = compareSet();
+  const box = $('#hero-list-box');
+  box.innerHTML = c.heroes.length
+    ? c.heroes.map(heroTile).join('')
+    : '<div class="empty" style="grid-column:1/-1">這幾個名字都沒找到，檢查一下有沒有打錯</div>';
+  $('#hero-count').innerHTML = `比較模式：找到 ${c.heroes.length} 位<button class="link-btn" id="cmp-reset">清除</button>`;
+  $('#cmp-note').innerHTML = [
+    ...c.ambiguous.map((a) => `<div class="cmp-note">
+      <p>「${esc(a.term)}」符合 ${a.cands.length} 位，${a.pick ? '比較的是：' : '點一位加入比較：'}</p>
+      <div class="chips">${a.cands.map((h) => `<button class="chip cmp-pick ${a.pick === h ? 'on' : ''}" data-term="${esc(a.term)}" data-id="${esc(h.id)}" aria-pressed="${a.pick === h}">${esc(h.name)}</button>`).join('')}</div>
+    </div>`),
+    ...c.missing.map((t) => `<p class="cmp-miss">找不到「${esc(t)}」<span class="muted">・圖鑑目前收 ${state.heroes.length} 位</span></p>`),
+    c.over ? `<p class="cmp-miss">一次最多比 ${CMP_MAX} 位，先比前 ${CMP_MAX} 位</p>` : '',
+  ].join('');
+  $('#cmp-bar').innerHTML = c.heroes.length >= 2
+    ? `<div class="actionbar"><button class="btn" id="go-cmp">比較這 ${c.heroes.length} 位 ›</button></div>`
+    : c.heroes.length === 1 ? '<p class="muted cmp-more">再打一個名字就能比較</p>' : '';
+  $$('.cmp-pick').forEach((b) => {
+    b.onclick = () => { state.cmpPicks[b.dataset.term] = b.dataset.id; renderCompareList(); };
+  });
+  $('#cmp-reset').onclick = () => {
+    clearCompare();
+    $('#q').value = '';
+    renderHeroList();
+    $('#q').focus();
+  };
+  $('#go-cmp')?.addEventListener('click', openCompare);
+  $$('.hcard', box).forEach((a) => { a.addEventListener('click', () => { state.heroScroll = window.scrollY; }); });
+}
+function openCompare() {
+  state.heroScroll = window.scrollY;
+  state.cmpSel = 0;
+  location.hash = 'compare';
+}
 function renderHeroes() {
   if (state.heroId) { renderHeroDetail(); return; }
   const factions = ['全部', ...FACTIONS];
   view.innerHTML = `
     ${pageHead('武將圖鑑')}
     <div class="filters">
-      <input id="q" type="search" enterkeyhint="search" aria-label="搜尋武將" placeholder="搜尋武將：關羽、謀關羽、界關羽…" value="${esc(state.q)}" autocomplete="off">
+      <input id="q" type="search" enterkeyhint="search" aria-label="搜尋武將" placeholder="搜尋武將，比較多位用空格隔開" value="${esc(state.q)}" autocomplete="off">
       <div class="chips scroll-x" role="group" aria-label="篩選">
         ${factions.map((f) => `<button class="chip fbtn f-${f} ${f === state.faction ? 'on' : ''}" data-f="${f}" aria-pressed="${f === state.faction}">${f === '全部' ? '' : '<span class="dot"></span>'}${f}</button>`).join('')}
         <button class="chip ${state.easyOnly ? 'on' : ''}" id="easy" aria-pressed="${state.easyOnly}">新手友善</button>
       </div>
     </div>
     <p class="muted" style="margin:-4px 0 10px" id="hero-count"></p>
-    <div id="hero-list-box" class="hgrid"></div>`;
+    <div id="cmp-note"></div>
+    <div id="hero-list-box" class="hgrid"></div>
+    <div id="cmp-bar"></div>`;
   $('#q').addEventListener('input', (e) => { state.q = e.target.value; renderHeroList(); });
-  // 只剩一位時按 Enter 直接打開
+  // Enter：比較模式就打開比較；只剩一位時直接打開那位
   $('#q').addEventListener('keydown', (e) => {
-    if (e.key !== 'Enter') return;
+    if (e.key !== 'Enter' || e.isComposing) return;
+    if (isCompareQuery()) {
+      if (compareSet().heroes.length >= 2) { e.target.blur(); openCompare(); }
+      return;
+    }
     const list = filteredHeroes();
     if (list.length === 1) location.hash = 'heroes/' + encodeURIComponent(list[0].id);
   });
@@ -544,23 +620,105 @@ function renderHeroDetail() {
       </div>
     </article>
     <div class="sec">技能<span class="muted">白話翻譯</span></div>
-    ${h.skills.map((s) => `<section class="skill">
-        <h3 class="skill-name">${esc(s.name)}</h3>
-        <p>${esc(s.plain)}</p>
-        ${s.tip ? `<div class="tip"><b>訣竅</b>${esc(s.tip)}</div>` : ''}
-      </section>`).join('')}
-    ${(() => {
-      const terms = glossaryFor([h.tagline, ...h.skills.flatMap((s) => [s.plain, s.tip])].join(' '));
-      return terms.length ? `<details class="card glossary">
-        <summary>看不懂的名詞：${terms.map(([t]) => esc(t)).join('、')}</summary>
-        <dl>${terms.map(([t, d]) => `<dt>${esc(t)}</dt><dd>${esc(d)}</dd>`).join('')}</dl>
-      </details>` : '';
-    })()}
+    ${skillsHtml(h)}
     ${h.aliases?.length ? `<p class="muted aliases">也叫：${h.aliases.map(esc).join('、')}</p>` : ''}`;
-  // 從列表點進來的就用瀏覽器返回，列表會停在原本的位置
+  bindBack();
+}
+// 技能卡＋看不懂的名詞（詳情頁、比較頁共用）
+function skillsHtml(h) {
+  const terms = glossaryFor([h.tagline, ...h.skills.flatMap((s) => [s.plain, s.tip])].join(' '));
+  return `${h.skills.map((s) => `<section class="skill">
+      <h3 class="skill-name">${esc(s.name)}</h3>
+      <p>${esc(s.plain)}</p>
+      ${s.tip ? `<div class="tip"><b>訣竅</b>${esc(s.tip)}</div>` : ''}
+    </section>`).join('')}
+    ${terms.length ? `<details class="card glossary">
+      <summary>看不懂的名詞：${terms.map(([t]) => esc(t)).join('、')}</summary>
+      <dl>${terms.map(([t, d]) => `<dt>${esc(t)}</dt><dd>${esc(d)}</dd>`).join('')}</dl>
+    </details>` : ''}`;
+}
+// 從列表點進來的就用瀏覽器返回，列表會停在原本的位置
+function bindBack() {
   $('#back').onclick = (e) => {
     if (state.cameFromList) { e.preventDefault(); history.back(); }
   };
+}
+
+/* ---------- 頁面：比較（拿到幾位武將要選一位時用） ---------- */
+function renderCompare() {
+  const { heroes } = compareSet();
+  const back = '<a class="back" href="#heroes" id="back">‹ 武將圖鑑</a>';
+  if (heroes.length < 2) {
+    view.innerHTML = `${back}${pageHead('比較武將')}
+      <div class="empty">還沒有要比較的武將。<br>在圖鑑的搜尋框一次打幾個名字，用空格隔開。
+        <p class="muted">比較的內容不會存檔，重新整理就會清掉。</p>
+        <a class="btn secondary small" href="#heroes">回武將圖鑑</a></div>`;
+    bindBack();
+    return;
+  }
+  const sel = Math.min(state.cmpSel, heroes.length - 1);
+  // 最好上手：只有大家難度不一樣時才說
+  const easiest = Math.min(...heroes.map((x) => x.difficulty || 9));
+  const easy = heroes.filter((x) => x.difficulty === easiest);
+  const easyLine = DIFF[easiest] && easy.length < heroes.length
+    ? `<p class="cmp-easy">最好上手：<b>${easy.map((x) => esc(x.name)).join('、')}</b><span class="muted">（${DIFF[easiest]}）</span></p>`
+    : '';
+  view.innerHTML = `${back}
+    ${pageHead(`比較${['', '', '兩', '三', '四', '五'][heroes.length]}位`)}
+    <div class="cmp-list">${heroes.map((x, i) => `<button class="cmp-row f-${esc(x.faction)} ${i === sel ? 'on' : ''}" data-i="${i}" aria-pressed="${i === sel}">
+        ${seal(x.faction)}
+        <span class="cmp-name"><b>${esc(x.name)}</b><small>${esc(x.version)}${x.title ? '・' + esc(x.title) : ''}</small></span>
+        <span class="cmp-meta">${hpHtml(x.hp)}${diffTag(x.difficulty)}</span>
+        <span class="cmp-tag">${esc(x.tagline)}</span>
+      </button>`).join('')}</div>
+    ${easyLine}
+    <div class="cmp-switch"><div class="seg" role="tablist" aria-label="看哪一位的技能">${heroes.map((x, i) => `<button role="tab" id="cmp-tab-${i}" class="${i === sel ? 'on' : ''}" data-i="${i}" aria-selected="${i === sel}" aria-controls="cmp-panel">${esc(x.name)}</button>`).join('')}</div></div>
+    <div id="cmp-panel" role="tabpanel"></div>
+    <div class="cmp-end">
+      <button class="btn secondary" id="cmp-clear">看完了，清除這次比較</button>
+      <p class="muted">比較的內容只在這支手機的這個畫面，不會存檔，也不會出現在戰績裡。</p>
+    </div>`;
+  showCompareHero(sel, false);
+  $$('.cmp-row').forEach((b) => { b.onclick = () => showCompareHero(+b.dataset.i, true); });
+  $$('.cmp-switch [role=tab]').forEach((b) => { b.onclick = () => showCompareHero(+b.dataset.i, false); });
+  // 左右鍵切換分頁（tablist 的標準操作）
+  $('.cmp-switch .seg').addEventListener('keydown', (e) => {
+    if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
+    const n = heroes.length;
+    const i = (state.cmpSel + (e.key === 'ArrowRight' ? 1 : n - 1)) % n;
+    showCompareHero(i, false);
+    $(`#cmp-tab-${i}`).focus();
+  });
+  $('#cmp-clear').onclick = () => {
+    clearCompare();
+    go('heroes');
+    window.scrollTo(0, 0);
+    toast('已清除這次比較');
+  };
+  bindBack();
+}
+// 切換要看哪一位的技能；jump = 從上面的摘要點的，捲到技能那裡
+function showCompareHero(i, jump) {
+  const heroes = compareSet().heroes;
+  const h = heroes[i];
+  if (!h) return;
+  state.cmpSel = i;
+  $$('.cmp-row').forEach((b, j) => { b.classList.toggle('on', j === i); b.setAttribute('aria-pressed', j === i); });
+  $$('.cmp-switch [role=tab]').forEach((b, j) => {
+    b.classList.toggle('on', j === i);
+    b.setAttribute('aria-selected', j === i);
+    b.tabIndex = j === i ? 0 : -1;
+  });
+  const panel = $('#cmp-panel');
+  panel.setAttribute('aria-labelledby', `cmp-tab-${i}`);
+  panel.innerHTML = `<div class="sec">${esc(h.name)}的技能<span class="muted">白話翻譯</span></div>${skillsHtml(h)}`;
+  // 切換列已經黏在頂部時（往下看過技能），換人後回到技能開頭
+  const sw = $('.cmp-switch');
+  const stuckAt = $('.topbar').offsetHeight + sw.offsetHeight;
+  const panelTop = panel.getBoundingClientRect().top;
+  if (jump || panelTop < stuckAt) {
+    window.scrollTo({ top: window.scrollY + panelTop - stuckAt, behavior: jump ? 'smooth' : 'auto' });
+  }
 }
 
 /* ---------- 頁面：開局（三步驟：入座 → 武將 → 亮身份） ---------- */
@@ -1555,7 +1713,13 @@ async function renderAdminAdmins() {
 /* ---------- 路由 ---------- */
 // admin 不在底部分頁列，只能從網址 #admin 或「我的」的管理頁按鈕進入
 // 武將詳情頁用 #heroes/<id>，可以用瀏覽器的返回鍵回列表
-const PAGES = { heroes: renderHeroes, new: renderNew, me: renderMe, rank: renderRank, admin: renderAdmin };
+// 比較頁 #compare 算在「武將」分頁底下；要比哪幾位只放在記憶體，不寫進網址
+const PAGES = { heroes: renderHeroes, compare: renderCompare, new: renderNew, me: renderMe, rank: renderRank, admin: renderAdmin };
+const tabOf = (page) => (page === 'compare' ? 'heroes' : page);
+// 離開武將分頁就清掉比較（避免下一個拿手機的人看到）
+function leaveHeroesIfNeeded(page) {
+  if (tabOf(page) !== 'heroes' && isCompareQuery()) clearCompare();
+}
 
 function parseHash() {
   const [t, arg] = location.hash.slice(1).split('/');
@@ -1568,6 +1732,7 @@ function go(tab) {
   if (!PAGES[tab]) tab = 'heroes';
   if (location.hash !== '#' + tab) history.replaceState(null, '', '#' + tab);
   if (tab !== 'new') state.justSaved = null;
+  leaveHeroesIfNeeded(tab);
   state.tab = tab;
   state.heroId = null;
   state.cameFromList = false;
@@ -1577,8 +1742,9 @@ async function onHashChange() {
   const { tab, heroId } = parseHash();
   if (tab === state.tab && heroId === state.heroId) return;
   const wasList = state.tab === 'heroes' && !state.heroId;
-  const backToList = tab === 'heroes' && !heroId && !!state.heroId;
-  state.cameFromList = !!heroId && wasList;
+  const backToList = tab === 'heroes' && !heroId && (!!state.heroId || state.tab === 'compare');
+  state.cameFromList = (!!heroId || tab === 'compare') && wasList;
+  leaveHeroesIfNeeded(tab);
   if (tab !== 'new') state.justSaved = null;
   state.tab = tab;
   state.heroId = heroId;
@@ -1587,7 +1753,7 @@ async function onHashChange() {
 }
 async function render() {
   $$('.tabbar button').forEach((b) => {
-    const on = b.dataset.tab === state.tab;
+    const on = b.dataset.tab === tabOf(state.tab);
     b.classList.toggle('active', on);
     if (on) b.setAttribute('aria-current', 'page'); else b.removeAttribute('aria-current');
   });

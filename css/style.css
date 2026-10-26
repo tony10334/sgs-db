@@ -78,7 +78,7 @@ body {
 }
 
 /* 紙面區塊：卡片類共用的文字色 */
-.card, .hcard, .hdetail, .skill, .stat, .win-btn {
+.card, .hcard, .hdetail, .skill, .stat, .win-btn, .cmp-list {
   --fg: var(--on-paper);
   --fg-muted: var(--on-paper-muted);
   --line: var(--paper-line);
@@ -393,6 +393,49 @@ details.glossary dd { margin: 0; font-size: 14px; line-height: 1.6; }
 }
 .tip b { color: var(--gold-text); margin-right: 6px; }
 .aliases { margin-top: 12px; }
+
+/* ---------- 比較（拿到幾位要選一位） ---------- */
+.filters.cmp-mode .chips { display: none; } /* 比較模式不套篩選，收起來 */
+.cmp-hint { display: block; }
+.cmp-note { margin: 0 0 12px; }
+.cmp-note p, .cmp-miss { margin: 0 0 6px; font-size: 14px; }
+.cmp-miss { margin-bottom: 10px; }
+.cmp-more { text-align: center; margin: 14px 0 0; }
+
+.cmp-list {
+  background: var(--paper); border-radius: var(--radius); overflow: hidden;
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, .35), 0 2px 0 rgba(0, 0, 0, .35);
+}
+.cmp-row {
+  display: grid; grid-template-columns: auto minmax(0, 1fr) auto;
+  grid-template-areas: "seal name meta" "tag tag tag";
+  gap: 6px 10px; align-items: center; width: 100%; text-align: left;
+  padding: 12px 14px; border: 0; border-radius: 0; background: none;
+  font: inherit; color: var(--fg); cursor: pointer;
+}
+.cmp-row + .cmp-row { border-top: 1px solid var(--line); }
+.cmp-row.on { background: var(--paper-3); box-shadow: inset 0 0 0 2px var(--gold-deep); }
+.cmp-row:focus-visible { outline-offset: -5px; }
+.cmp-row > .seal { grid-area: seal; }
+.cmp-name { grid-area: name; min-width: 0; }
+.cmp-name b { display: block; font-family: var(--serif); font-weight: 900; font-size: 18px; letter-spacing: 1px; line-height: 1.25; }
+.cmp-name small { display: block; font-size: 12px; color: var(--fg-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.cmp-meta { grid-area: meta; display: flex; flex-direction: column; align-items: flex-end; gap: 5px; }
+.cmp-tag { grid-area: tag; font-size: 14px; line-height: 1.55; }
+.cmp-easy { margin: 12px 2px 0; font-size: 14px; }
+.cmp-easy b { color: var(--gold); font-family: var(--serif); letter-spacing: 1px; }
+/* 切換列黏在頂部，往下看技能時也能直接換人 */
+.cmp-switch {
+  position: sticky; top: var(--topbar-h); z-index: 5;
+  margin: 14px -16px 0; padding: 8px 16px;
+  background: linear-gradient(var(--ink) 85%, rgba(22, 18, 14, 0));
+}
+.cmp-switch .seg button {
+  padding: 0 4px; font-family: var(--serif); font-weight: 700; letter-spacing: 1px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.cmp-end { display: grid; gap: 8px; margin-top: 18px; text-align: center; }
+.cmp-end .muted { margin: 0; }
 
 /* ---------- 開局 ---------- */
 .stepper { display: flex; list-style: none; margin: 0 0 14px; padding: 0; }
